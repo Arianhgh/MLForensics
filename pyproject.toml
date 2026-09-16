@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mlforensics"
+dynamic = ["version"]
+description = "Portable, deterministic run capsules for machine-learning forensics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "mlforensics contributors" }]
+keywords = ["machine learning", "debugging", "regression testing", "reproducibility", "forensics"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["tomli>=2.0; python_version < '3.11'"]
+
+[project.optional-dependencies]
+numpy = ["numpy>=1.23"]
+torch = ["torch>=2.0"]
+onnx = ["onnxruntime>=1.15"]
+mlflow = ["mlflow>=2.0"]
+wandb = ["wandb>=0.16"]
+dvc = ["pyyaml>=6.0"]
+fsspec = ["fsspec>=2023.1"]
+s3 = ["fsspec>=2023.1", "s3fs>=2023.1"]
+gcs = ["fsspec>=2023.1", "gcsfs>=2023.1"]
+azure = ["fsspec>=2023.1", "adlfs>=2023.1"]
+integrations = ["mlflow>=2.0", "wandb>=0.16", "pyyaml>=6.0", "fsspec>=2023.1"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "build>=1.0", "ruff>=0.6", "twine>=5.1"]
+
+[project.scripts]
+mlforensics = "mlforensics.cli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mlforensics"]
+
+[tool.hatch.version]
+path = "mlforensics/__about__.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

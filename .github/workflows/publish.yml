@@ -1,0 +1,68 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Verify release tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY'
+          import ast
+          import os
+          from pathlib import Path
+
+          tree = ast.parse(Path("mlforensics/__about__.py").read_text(encoding="utf-8"))
+          version = next(
+              ast.literal_eval(node.value)
+              for node in tree.body
+              if isinstance(node, ast.Assign)
+              and any(
+                  isinstance(target, ast.Name) and target.id == "__version__"
+                  for target in node.targets
+              )
+          )
+          tag = os.environ["RELEASE_TAG"]
+          if tag.removeprefix("v") != version:
+              raise SystemExit(f"release tag {tag!r} does not match version {version!r}")
+          PY
+      - name: Test and build distributions
+        run: |
+          python -m pip install -e ".[dev,numpy]"
+          python -m ruff check mlforensics tests
+          python -m pytest
+          python -m build --sdist --wheel
+          python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/mlforensics/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - name: Publish distributions
+        uses: pypa/gh-action-pypi-publish@release/v1

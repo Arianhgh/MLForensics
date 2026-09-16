@@ -1,0 +1,110 @@
+{
+  "missing_required_metric": {
+    "passed": true,
+    "checks": [
+      "statistical and resource regression",
+      "run completed successfully",
+      "no non-finite candidate observations",
+      "candidate evidence is present"
+    ]
+  },
+  "bisect_seed_pairing": {
+    "first_bad": "bad",
+    "decision": {
+      "status": "regression",
+      "lower": 100.0,
+      "upper": 100.0,
+      "estimate": 100.0,
+      "tolerance": 1.0,
+      "confidence": 0.95,
+      "samples": 2,
+      "higher_is_better": false
+    },
+    "true_shared_seed_delta": 0
+  },
+  "bisect_stale_cache": {
+    "second_first_bad": "bad",
+    "second_executed_runs": 0
+  },
+  "replay_seed_overwrites_snapshot": {
+    "reproduced": false,
+    "error": "expected failure did not occur",
+    "restored": [
+      "Python RNG",
+      "NumPy RNG",
+      "Python RNG seed"
+    ]
+  },
+  "replay_post_failure_state": {
+    "stored": {
+      "model": {
+        "step": 1
+      }
+    },
+    "reproduced": false,
+    "error": "expected failure did not occur"
+  },
+  "shrink_cannot_read_replay_input": {
+    "returncode": 2,
+    "stderr": "usage: mlforensics [-h] [--config CONFIG]\n                   {run,compare,bisect,replay,shrink,trace,impact,parity,ci} ...\nmlforensics: error: capsule does not contain a JSON failure input or batch"
+  },
+  "shrink_changes_failure": {
+    "returncode": 0,
+    "result": {
+      "evaluations": 3,
+      "final_size": 1,
+      "history": [
+        {
+          "accepted": true,
+          "count": 2,
+          "operation": "remove_chunk",
+          "size": 1,
+          "start": 0
+        }
+      ],
+      "metadata": {
+        "initial_failing": true,
+        "strategy": "ddmin",
+        "verified": true
+      },
+      "original_size": 3,
+      "value": [
+        3
+      ]
+    }
+  },
+  "impact_relative_import": {
+    "affected_nodes": [
+      "file:/private/var/folders/jt/9hn1053x1179cdcv3nfkgrjh0000gn/T/tmpt21o6h61/pkg/features.py",
+      "pkg.features:feature"
+    ],
+    "missed_model": true
+  },
+  "confidence_only_change": {
+    "changed_predictions": 0,
+    "change_rate": 0.0,
+    "confidence_only_changes": 1
+  },
+  "nan_destroys_capsule": {
+    "error_type": "ValidationError",
+    "error": "metric values must be finite numbers",
+    "capsule_exists": false
+  },
+  "cli_replay_exception_name": {
+    "returncode": 1,
+    "reproduced": false,
+    "signature_match": false,
+    "expected_type": "builtins.ValueError",
+    "stderr_final_line": "ValueError: target failure"
+  },
+  "torch_state_codec": {
+    "torch_version": "2.11.0",
+    "reproduced": false,
+    "error": "failed to restore state 'model': RuntimeError: Error(s) in loading state_dict for Linear:\n\tWhile copying the parameter named \"weight\", expected torch.Tensor or Tensor-like object from checkpoint but received <class 'list'>\n\tWhile copying the parameter named \"bias\", expected torch.Tensor or Tensor-like object from checkpoint but received <class 'list'>"
+  },
+  "parity_generated_dtype": {
+    "returncode": 1,
+    "passed": false,
+    "error": "RuntimeError: mat1 and mat2 must have the same dtype, but got Double and Float"
+  }
+}

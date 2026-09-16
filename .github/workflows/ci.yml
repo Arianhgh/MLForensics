@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev,numpy]"
+      - name: Lint
+        run: |
+          python -m ruff check mlforensics tests
+          python -m ruff format --check mlforensics tests
+      - name: Test
+        run: >-
+          python -m pytest
+          --cov=mlforensics
+          --cov-report=term-missing
+          --cov-fail-under=68
+
+  test-torch:
+    name: PyTorch CPU
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install PyTorch test dependencies
+        run: python -m pip install -e ".[dev,numpy,torch]"
+      - name: Test PyTorch workflows
+        run: >-
+          python -m pytest
+          tests/core/test_state_codecs.py
+          tests/capture/test_training.py
+          tests/diagnose/test_pytorch_workflow.py
+          tests/diagnose/test_p0_evidence.py
+          tests/diagnose/test_checkpoints.py
+          -q
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install release tools
+        run: python -m pip install build twine
+      - name: Build distributions
+        run: python -m build --sdist --wheel
+      - name: Validate distributions
+        run: python -m twine check dist/*
+      - name: Smoke-test wheel
+        run: |
+          python -m venv /tmp/mlforensics-smoke
+          /tmp/mlforensics-smoke/bin/python -m pip install --no-deps dist/*.whl
+          /tmp/mlforensics-smoke/bin/python - <<'PY'
+          import importlib
+          import pkgutil
+          import mlforensics
+
+          for module in pkgutil.walk_packages(
+              mlforensics.__path__, mlforensics.__name__ + "."
+          ):
+              importlib.import_module(module.name)
+          print(mlforensics.__version__)
+          PY
+          /tmp/mlforensics-smoke/bin/mlforensics --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
