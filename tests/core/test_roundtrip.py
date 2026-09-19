@@ -61,6 +61,19 @@ def test_directory_and_zip_capsule_round_trip(tmp_path: Path) -> None:
     assert archive.read_bytes() == capsule.save(tmp_path / "portable-again.mlcap.zip").read_bytes()
 
 
+def test_canonical_capsule_payload_does_not_require_legacy_run_json(tmp_path: Path) -> None:
+    capsule = RunCapsule(Run(run_id="canonical-only", status="completed", started_at="t"))
+    directory = capsule.save(tmp_path / "canonical-only.mlcap")
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    manifest["files"].remove("run.json")
+    manifest["sha256"].pop("run.json")
+    (directory / "run.json").unlink()
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    loaded = RunCapsule.load(directory)
+    assert loaded.run.run_id == "canonical-only"
+
+
 def test_failure_signature_is_stable_for_volatile_values() -> None:
     def fail(value: int) -> FailureSignature:
         try:

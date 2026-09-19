@@ -1,4 +1,11 @@
+"""Adversarial regression probes for the local development checkout."""
+
+# The script intentionally changes into the checkout before importing the
+# package so it can probe an uninstalled source tree.
+# ruff: noqa: E402
+
 import json
+import os
 import random
 import shlex
 import subprocess
@@ -8,7 +15,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-import os
 
 os.chdir(ROOT)
 from mlforensics import BisectCache, CaptureContext, Run, behavioral_diff, bisect_commits, ci_gate
@@ -41,18 +47,30 @@ values = {
     "bad": {11: {"error": "failed"}, 29: 100, 37: 200},
 }
 r = bisect_commits(
-    git, lambda seed: values[git.current][seed], [11, 29, 37], tolerance=1, n_resamples=100
+    git,
+    lambda seed: values[git.current][seed],
+    [11, 29, 37],
+    tolerance=1,
+    n_resamples=100,
+    min_observations=3,
 )
 out["bisect_seed_pairing"] = {
     "first_bad": r.first_bad,
-    "decision": r.decisions["bad"].to_dict(),
+    "decision": r.decisions.get("bad").to_dict() if "bad" in r.decisions else None,
+    "inconclusive": r.inconclusive,
     "true_shared_seed_delta": 0,
 }
 
 cache = BisectCache()
 git = Git()
-a = bisect_commits(git, lambda seed: 0 if git.current == "good" else 10, [11, 29], cache=cache)
-b = bisect_commits(git, lambda seed: 0, [11, 29], cache=cache)
+a = bisect_commits(
+    git,
+    lambda seed: 0 if git.current == "good" else 10,
+    [11, 29],
+    cache=cache,
+    min_observations=2,
+)
+b = bisect_commits(git, lambda seed: 0, [11, 29], cache=cache, min_observations=2)
 out["bisect_stale_cache"] = {
     "second_first_bad": b.first_bad,
     "second_executed_runs": b.metadata["executed_runs"],
@@ -126,7 +144,10 @@ with tempfile.TemporaryDirectory() as td:
     }
     predicate = root / "predicate.py"
     predicate.write_text(
-        'import json,sys\nx=json.load(sys.stdin)\nif len(x)==3: raise RuntimeError("original failure")\nraise KeyError("different failure")\n'
+        "import json,sys\n"
+        "x=json.load(sys.stdin)\n"
+        'if len(x)==3: raise RuntimeError("original failure")\n'
+        'raise KeyError("different failure")\n'
     )
     r = subprocess.run(
         [
@@ -246,9 +267,10 @@ else:
             capture_output=True,
         )
         d = json.loads(r.stdout)
+        case_error = d["cases"][0].get("error")
         out["parity_generated_dtype"] = {
             "returncode": r.returncode,
             "passed": d["passed"],
-            "error": d["cases"][0]["error"].strip().splitlines()[-1],
+            "error": case_error.strip().splitlines()[-1] if case_error else None,
         }
 print(json.dumps(out, indent=2))

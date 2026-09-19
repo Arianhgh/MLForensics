@@ -209,3 +209,63 @@ def test_core_capture_inherits_parent_run_and_writes_child_capsule(tmp_path, mon
     loaded = RunCapsule.load(child)
     assert loaded.run.run_id == "parent-1"
     assert [metric.name for metric in loaded.run.metrics] == ["loss"]
+
+
+def test_sparse_replay_does_not_skip_intervening_steps():
+    capture = CaptureContext(state_providers={"model": lambda: {"n": 0}})
+    with pytest.raises(ValueError, match="later"):
+        with capture:
+            capture.record_checkpoint(
+                0, batch=["first"], state_providers={"model": lambda: {"n": 0}}
+            )
+            capture.record_offending_batch(["later"], step=2)
+            raise ValueError("later")
+
+    seen: list[object] = []
+    result = ReplayEngine(state_restorers={"model": lambda _state: None}).replay(
+        capture.capsule, lambda value: seen.append(value)
+    )
+    assert seen == []
+    assert result.reproduced is False
+    assert result.metadata.get("status") == "incomplete-replay"
+    assert result.metadata["requested_step"] == 2 or result.metadata["checkpoint_step"] == 0
+
+
+def test_replay_executes_intervening_recorded_steps():
+    capture = CaptureContext(state_providers={"model": lambda: {"n": 0}}, input_history_limit=8)
+    with pytest.raises(ValueError, match="later"):
+        with capture:
+            capture.record_checkpoint(
+                0, batch=["first"], state_providers={"model": lambda: {"n": 0}}
+            )
+            capture.record_input_history(1, ["middle"])
+            capture.record_offending_batch(["later"], step=2)
+            raise ValueError("later")
+
+    seen: list[object] = []
+
+    def runner(value):
+        seen.append(value)
+        if value == ["later"]:
+            raise ValueError("later")
+
+    result = ReplayEngine(state_restorers={"model": lambda _state: None}).replay(
+        capture.capsule, runner
+    )
+    assert seen == [["first"], ["middle"], ["later"]]
+    assert result.reproduced
+    assert result.metadata.get("executed_steps") == [0, 1, 2]
+
+
+def test_omitted_model_state_is_not_verified_restoration():
+    capture = CaptureContext(replay_input=1, state_providers={"model": lambda: {"n": 0}})
+    with pytest.raises(ValueError, match="target"):
+        with capture:
+            raise ValueError("target")
+
+    result = ReplayEngine(strict_state=False).replay(
+        capture.capsule, lambda _value: (_ for _ in ()).throw(ValueError("target"))
+    )
+    assert result.reproduced
+    assert result.metadata["state_restoration_verified"] is False
+    assert "model" in result.metadata["omitted_state"]

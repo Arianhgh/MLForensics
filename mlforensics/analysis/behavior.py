@@ -10,6 +10,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 def _as_list(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -250,20 +262,22 @@ class SliceResult:
         # A slice can cover millions of rows. The predicate in ``metadata`` and
         # ``support`` fully describe membership, so only a sample of row indices
         # is serialised; embedding all of them would dominate the report.
-        return {
-            "name": self.name,
-            "example_indices": self.indices[:max_example_indices],
-            "example_indices_truncated": len(self.indices) > max_example_indices,
-            "baseline_score": self.baseline_score,
-            "candidate_score": self.candidate_score,
-            "delta": self.delta,
-            "support": self.support,
-            "metadata": self.metadata,
-            "confidence_interval": (
-                list(self.confidence_interval) if self.confidence_interval is not None else None
-            ),
-            "confidence": self.confidence,
-        }
+        return _json_safe(
+            {
+                "name": self.name,
+                "example_indices": self.indices[:max_example_indices],
+                "example_indices_truncated": len(self.indices) > max_example_indices,
+                "baseline_score": self.baseline_score,
+                "candidate_score": self.candidate_score,
+                "delta": self.delta,
+                "support": self.support,
+                "metadata": self.metadata,
+                "confidence_interval": (
+                    list(self.confidence_interval) if self.confidence_interval is not None else None
+                ),
+                "confidence": self.confidence,
+            }
+        )
 
 
 @dataclass(slots=True)
@@ -300,50 +314,52 @@ class BehavioralDiff:
     slice_claim: str = "exploratory"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "sample_count": self.sample_count,
-            "changed_predictions": self.changed_predictions,
-            "class_flips": self.class_flips,
-            "confidence_only_changes": self.confidence_only_changes,
-            "prediction_change_rate": self.prediction_change_rate,
-            "class_flip_rate": self.class_flip_rate,
-            "total_behavior_changes": self.total_behavior_changes,
-            "total_behavior_change_rate": self.total_behavior_change_rate,
-            "slice_claim": self.slice_claim,
-            "baseline_accuracy": self.baseline_accuracy,
-            "candidate_accuracy": self.candidate_accuracy,
-            "confidence_delta_mean": self.confidence_delta_mean,
-            "confidence_delta_median": self.confidence_delta_median,
-            "flips_to_correct": self.flips_to_correct,
-            "flips_to_incorrect": self.flips_to_incorrect,
-            "accuracy_delta": self.accuracy_delta,
-            "accuracy_delta_interval": (
-                list(self.accuracy_delta_interval)
-                if self.accuracy_delta_interval is not None
-                else None
-            ),
-            "prediction_change_interval": (
-                list(self.prediction_change_interval)
-                if self.prediction_change_interval is not None
-                else None
-            ),
-            "confidence": self.confidence,
-            "regression": self.regression,
-            "baseline_class_distribution": self.baseline_class_distribution,
-            "candidate_class_distribution": self.candidate_class_distribution,
-            "distribution_total_variation": self.distribution_total_variation,
-            "baseline_calibration_error": self.baseline_calibration_error,
-            "candidate_calibration_error": self.candidate_calibration_error,
-            "calibration_delta": self.calibration_delta,
-            "calibration_delta_interval": (
-                list(self.calibration_delta_interval)
-                if self.calibration_delta_interval is not None
-                else None
-            ),
-            "calibration_regression": self.calibration_regression,
-            "slices": [item.to_dict() for item in self.slices],
-            "metadata": self.metadata,
-        }
+        return _json_safe(
+            {
+                "sample_count": self.sample_count,
+                "changed_predictions": self.changed_predictions,
+                "class_flips": self.class_flips,
+                "confidence_only_changes": self.confidence_only_changes,
+                "prediction_change_rate": self.prediction_change_rate,
+                "class_flip_rate": self.class_flip_rate,
+                "total_behavior_changes": self.total_behavior_changes,
+                "total_behavior_change_rate": self.total_behavior_change_rate,
+                "slice_claim": self.slice_claim,
+                "baseline_accuracy": self.baseline_accuracy,
+                "candidate_accuracy": self.candidate_accuracy,
+                "confidence_delta_mean": self.confidence_delta_mean,
+                "confidence_delta_median": self.confidence_delta_median,
+                "flips_to_correct": self.flips_to_correct,
+                "flips_to_incorrect": self.flips_to_incorrect,
+                "accuracy_delta": self.accuracy_delta,
+                "accuracy_delta_interval": (
+                    list(self.accuracy_delta_interval)
+                    if self.accuracy_delta_interval is not None
+                    else None
+                ),
+                "prediction_change_interval": (
+                    list(self.prediction_change_interval)
+                    if self.prediction_change_interval is not None
+                    else None
+                ),
+                "confidence": self.confidence,
+                "regression": self.regression,
+                "baseline_class_distribution": self.baseline_class_distribution,
+                "candidate_class_distribution": self.candidate_class_distribution,
+                "distribution_total_variation": self.distribution_total_variation,
+                "baseline_calibration_error": self.baseline_calibration_error,
+                "candidate_calibration_error": self.candidate_calibration_error,
+                "calibration_delta": self.calibration_delta,
+                "calibration_delta_interval": (
+                    list(self.calibration_delta_interval)
+                    if self.calibration_delta_interval is not None
+                    else None
+                ),
+                "calibration_regression": self.calibration_regression,
+                "slices": [item.to_dict() for item in self.slices],
+                "metadata": self.metadata,
+            }
+        )
 
     @property
     def n(self) -> int:

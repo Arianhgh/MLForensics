@@ -35,6 +35,9 @@ class _DefinitionCollector(ast.NodeVisitor):
                 {"qualname": qualname, "line": getattr(node, "lineno", None)},
             )
         )
+        self.graph.nodes[identifier].metadata["end_line"] = getattr(
+            node, "end_lineno", getattr(node, "lineno", None)
+        )
         parent = f"{self.module_id}:{'.'.join(self.scope)}" if self.scope else self.module_id
         self.graph.add_edge(
             parent,
@@ -88,7 +91,7 @@ class _DependencyVisitor(ast.NodeVisitor):
 
     def visit_Import(self, node: ast.Import) -> None:
         for item in node.names:
-            imported = item.name if item.asname is None else item.name
+            imported = item.name
             target = self._import_target(imported)
             self.graph.add_node(
                 Node(target, "module", imported, None, {"external": target == _module_id(imported)})
@@ -105,7 +108,9 @@ class _DependencyVisitor(ast.NodeVisitor):
                     "explanation": f"import {item.name}",
                 },
             )
-            self.aliases[item.asname or item.name.split(".")[0]] = target
+            bound_name = item.asname or item.name.split(".")[0]
+            self.aliases[item.name] = target
+            self.aliases[bound_name] = target
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = "." * node.level + (node.module or "")
@@ -232,8 +237,29 @@ class _DependencyVisitor(ast.NodeVisitor):
                     "explanation": "dynamic import with a static module name",
                 },
             )
+        elif (isinstance(node.func, ast.Name) and node.func.id == "__import__") or (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "importlib"
+            and node.func.attr == "import_module"
+        ):
+            target = "unknown:dynamic-import"
+            self.graph.add_node(
+                Node(target, "unknown", "dynamic import", self.path, {"conservative": True})
+            )
+            self.graph.add_edge(
+                self.source_id(),
+                target,
+                "imports",
+                {
+                    "line": node.lineno,
+                    "confidence": "low",
+                    "explanation": "dynamic import target is not statically known",
+                },
+            )
         target = self.resolve_expr(node.func)
         if target and target != self.source_id():
+            known_target = target in self.graph.nodes
             if target not in self.graph.nodes:
                 self.graph.add_node(
                     Node(target, "callable", target.rsplit(":", 1)[-1], None, {"external": True})
@@ -244,7 +270,7 @@ class _DependencyVisitor(ast.NodeVisitor):
                 "calls",
                 {
                     "line": node.lineno,
-                    "confidence": "high" if target in self.graph.nodes else "low",
+                    "confidence": "high" if known_target else "low",
                     "explanation": "statically resolved call",
                 },
             )
@@ -259,6 +285,14 @@ class _DependencyVisitor(ast.NodeVisitor):
         self._visit_scoped(node)
 
     def resolve_expr(self, expression: ast.AST) -> str | None:
+        def dotted_name(value: ast.AST) -> str | None:
+            if isinstance(value, ast.Name):
+                return value.id
+            if isinstance(value, ast.Attribute):
+                prefix = dotted_name(value.value)
+                return f"{prefix}.{value.attr}" if prefix else value.attr
+            return None
+
         if isinstance(expression, ast.Name):
             if expression.id in self.aliases:
                 return self.aliases[expression.id]
@@ -269,6 +303,9 @@ class _DependencyVisitor(ast.NodeVisitor):
                 if expression.id in methods:
                     return methods[expression.id]
         if isinstance(expression, ast.Attribute):
+            dotted = dotted_name(expression)
+            if dotted in self.aliases:
+                return self.aliases[dotted]
             if (
                 isinstance(expression.value, ast.Name)
                 and expression.value.id == "self"

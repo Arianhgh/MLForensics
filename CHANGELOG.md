@@ -6,7 +6,23 @@ may change between minor releases while the package is below 1.0.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-16
+
 ### Fixed
+
+- JSON capture reports are now kept machine-readable when the child prints to
+  stdout, and all subcommands accept the same config option placement.
+- Parity validates dtype contracts, rejects malformed multi-input calls,
+  validates the reference before judging the candidate, and distinguishes
+  failed parity from inconclusive reference evidence in its exit status.
+- Impact analysis retains aliased and relative imports, dynamic-import
+  uncertainty, and conservative dependencies for deleted, renamed, notebook,
+  configuration, data, and generated files. Edges include confidence and an
+  explanation.
+- Optional integration exports are resolved lazily, so importing
+  `mlforensics.integrations` does not load provider modules.
+- Source distributions now contain only release documentation, metadata, and
+  package sources; audit artifacts and repository tests are excluded.
 
 - `compare`/`ci` no longer treat successive training steps within one run as
   independent repetitions. A metric series from a single run is one repetition,
@@ -40,6 +56,19 @@ may change between minor releases while the package is below 1.0.
   to compare several seeded runs per side, which is what a run-level claim requires.
 - `bisect --min-observations` to set the evidence required before a revision is
   classified.
+- The packaged `mlcap-1` JSON Schema and protocol document, capsule migrations,
+  selective artifact/file retention, bounded loading, provenance attestations,
+  and caller-provided signature verification.
+- Fresh-process replay workers, resumable and domain-aware shrinkers, PyTorch
+  training-state capture, and structured timeout/exception outcomes.
+- Eager PyTorch export, stateful and structured parity, optional TensorRT and
+  OpenVINO adapters, feature parity for Python/Pandas/SQL/DuckDB, and
+  intermediate-output hooks.
+- SQL, notebook, shell, and pipeline impact readers; DVC/OpenLineage-shaped
+  lineage import/export; and CI reports in JUnit, SARIF, and GitHub formats.
+- Lazy entry-point plugins with capability negotiation, sensitive-data scanning,
+  redaction, append-only audit logs, legal holds, recoverable retention,
+  offline remote queues, and safe remote-operation facades.
 
 ### Changed
 

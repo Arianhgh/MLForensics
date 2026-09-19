@@ -51,11 +51,16 @@ class CaptureHook(Protocol):
     def on_failure(self, failure: FailureSignature) -> None: ...
 
 
-def _call(hooks: Iterable[CaptureHook], method: str, value: Any) -> None:
+def _call(hooks: Iterable[CaptureHook], method: str, value: Any) -> dict[str, str]:
+    errors: dict[str, str] = {}
     for hook in hooks:
         callback = getattr(hook, method, None)
         if callback is not None:
-            callback(value)
+            try:
+                callback(value)
+            except BaseException as exc:
+                errors[f"hook:{type(hook).__qualname__}:{method}"] = f"{type(exc).__name__}: {exc}"
+    return errors
 
 
 def _json_default(value: Any) -> Any:
@@ -74,6 +79,51 @@ def _json_default(value: Any) -> Any:
 
 def _encode_state(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=_json_default)
+
+
+def _model_mode(model: Any) -> str | None:
+    training = getattr(model, "training", None)
+    if isinstance(training, bool):
+        return "train" if training else "eval"
+    return None
+
+
+def _has_gradients(model: Any) -> bool | None:
+    parameters = getattr(model, "parameters", None)
+    if not callable(parameters):
+        return None
+    try:
+        for parameter in parameters():
+            grad = getattr(parameter, "grad", None)
+            if grad is not None:
+                return True
+    except Exception:
+        return None
+    return False
+
+
+def _autocast_enabled() -> bool:
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return False
+    try:
+        amp = getattr(torch, "amp", None)
+        if amp is not None and hasattr(amp, "is_autocast_enabled"):
+            return bool(amp.is_autocast_enabled())
+        cuda = getattr(torch, "is_autocast_enabled", None)
+        if callable(cuda):
+            return bool(cuda())
+    except Exception:
+        return False
+    return False
+
+
+def _integerish_step(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and float(value) == int(value)
+    )
 
 
 def _portable_state(value: Any) -> Any:
@@ -173,6 +223,8 @@ class CaptureContext:
         replay_seed: int | None = None,
         evidence: Mapping[str, Any] | None = None,
         checkpoint_limit: int = 3,
+        checkpoint_interval: int = 1,
+        input_history_limit: int = 32,
     ) -> None:
         if root is not None and artifact_store is not None:
             raise ValueError("pass either root or artifact_store, not both")
@@ -204,7 +256,21 @@ class CaptureContext:
             or checkpoint_limit < 0
         ):
             raise ValueError("checkpoint_limit must be a non-negative integer")
+        if (
+            isinstance(checkpoint_interval, bool)
+            or not isinstance(checkpoint_interval, int)
+            or checkpoint_interval < 1
+        ):
+            raise ValueError("checkpoint_interval must be a positive integer")
+        if (
+            isinstance(input_history_limit, bool)
+            or not isinstance(input_history_limit, int)
+            or input_history_limit < 0
+        ):
+            raise ValueError("input_history_limit must be a non-negative integer")
         self._checkpoint_limit = checkpoint_limit
+        self._checkpoint_interval = checkpoint_interval
+        self._input_history_limit = input_history_limit
         self._closed = False
         if replay_input is not None:
             self.record_replay_input(replay_input)
@@ -227,10 +293,13 @@ class CaptureContext:
         return self._capsule
 
     def __enter__(self) -> CaptureContext:
-        _call(self._hooks, "on_start", self)
+        self._record_hook_errors(_call(self._hooks, "on_start", self))
         # Capture pre-step application state before user code mutates it.
         if self._state_providers:
-            self._snapshot_registered_state(role="replay")
+            try:
+                self._snapshot_registered_state(role="replay")
+            except BaseException as exc:
+                self.record_capture_error("state", exc)
         return self
 
     def __exit__(
@@ -284,6 +353,17 @@ class CaptureContext:
         if self._closed:
             raise RuntimeError("capture is already closed")
 
+    def _record_hook_errors(self, errors: Mapping[str, str]) -> None:
+        if errors:
+            self._evidence.setdefault("capture_errors", {}).update(dict(errors))
+
+    def record_capture_error(self, component: str, error: BaseException | str) -> None:
+        """Record a secondary capture failure without replacing the incident."""
+        if not isinstance(component, str) or not component.strip():
+            raise ValueError("capture error component must be a non-empty string")
+        detail = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
+        self._evidence.setdefault("capture_errors", {})[component] = detail
+
     def event(
         self,
         kind: str | TraceEvent,
@@ -299,7 +379,7 @@ class CaptureContext:
             else TraceEvent(kind=kind, message=message, step=step, data=data or {})
         )
         self._events.append(event)
-        _call(self._hooks, "on_event", event)
+        self._record_hook_errors(_call(self._hooks, "on_event", event))
         return event
 
     def record_event(
@@ -419,14 +499,26 @@ class CaptureContext:
         metadata: Mapping[str, Any] | None = None,
         identity: Any = None,
     ) -> MetricSeries | ResourceSeries:
-        observation = Observation.from_value(
-            name,
-            value,
-            identity=identity if identity is not None else step,
-            step=step,
-            timestamp=timestamp,
-            metadata={"kind": kind, **dict(metadata or {})},
-        )
+        try:
+            observation = Observation.from_value(
+                name,
+                value,
+                identity=identity if identity is not None else step,
+                step=step,
+                timestamp=timestamp,
+                metadata={"kind": kind, **dict(metadata or {})},
+            )
+        except BaseException as exc:
+            self.record_capture_error(f"observation:{kind}:{name}", exc)
+            observation = Observation.from_value(
+                name,
+                value,
+                identity=None,
+                step=None,
+                timestamp=None,
+                metadata={"kind": kind},
+                error=f"observation conversion failed: {type(exc).__name__}: {exc}",
+            )
         self._observations.append(observation)
         self._evidence.setdefault("observations", []).append(observation.to_dict())
         # Keep the return contract useful to callers that append values without
@@ -537,7 +629,7 @@ class CaptureContext:
         # a configured artifact store also receives a copy.
         self._payloads[ref.sha256] = blob
         self._artifacts.append(ref)
-        _call(self._hooks, "on_artifact", ref)
+        self._record_hook_errors(_call(self._hooks, "on_artifact", ref))
         return ref
 
     add_artifact = artifact
@@ -641,6 +733,7 @@ class CaptureContext:
         sampler_position: int | None = None,
         sample_ids: Sequence[Any] | None = None,
         before_step: bool = True,
+        force: bool = False,
     ) -> Mapping[str, Any]:
         """Record a bounded replay checkpoint for a training step.
 
@@ -658,7 +751,17 @@ class CaptureContext:
         ):
             raise ValueError("checkpoint step must be a finite number")
         if self._checkpoint_limit == 0:
+            if batch is not None:
+                self.record_input_history(step, batch)
             return {"step": step, "stored": False, "reason": "checkpoint_limit=0"}
+        if _integerish_step(step) and int(step) % self._checkpoint_interval != 0 and not force:
+            if batch is not None:
+                self.record_input_history(step, batch)
+            return {
+                "step": step,
+                "stored": False,
+                "reason": f"checkpoint_interval={self._checkpoint_interval}",
+            }
         providers = dict(self._state_providers)
         providers.update(dict(state_providers or {}))
         state: dict[str, Any] = {}
@@ -677,11 +780,27 @@ class CaptureContext:
             errors["__rng__"] = f"{type(exc).__name__}: {exc}"
         portable_batch = None
         if batch is not None:
-            portable_batch = _replay_value(self, batch, name=f"checkpoint-{step}-batch")
+            try:
+                portable_batch = _replay_value(self, batch, name=f"checkpoint-{step}-batch")
+            except BaseException as exc:
+                errors["__batch__"] = f"{type(exc).__name__}: {exc}"
         elif sample_ids is not None:
-            portable_batch = {
-                "sample_ids": _replay_value(self, list(sample_ids), name=f"checkpoint-{step}-ids")
-            }
+            try:
+                portable_batch = {
+                    "sample_ids": _replay_value(
+                        self, list(sample_ids), name=f"checkpoint-{step}-ids"
+                    )
+                }
+            except BaseException as exc:
+                errors["__sample_ids__"] = f"{type(exc).__name__}: {exc}"
+        encoded_sample_ids = None
+        if sample_ids is not None:
+            try:
+                encoded_sample_ids = _replay_value(
+                    self, list(sample_ids), name=f"checkpoint-{step}-sample-ids"
+                )
+            except BaseException as exc:
+                errors["__sample_ids__"] = f"{type(exc).__name__}: {exc}"
         checkpoint = {
             "step": step,
             "before_step": bool(before_step),
@@ -690,11 +809,7 @@ class CaptureContext:
             "batch": portable_batch,
             "epoch": epoch,
             "sampler_position": sampler_position,
-            "sample_ids": (
-                _replay_value(self, list(sample_ids), name=f"checkpoint-{step}-sample-ids")
-                if sample_ids is not None
-                else None
-            ),
+            "sample_ids": encoded_sample_ids,
             "state_capture_errors": errors,
         }
         replay = self._evidence.setdefault("replay", {})
@@ -709,7 +824,54 @@ class CaptureContext:
             self._evict_unreferenced_payloads()
         if errors:
             replay.setdefault("checkpoint_capture_errors", {}).update(errors)
+        if batch is not None:
+            self.record_input_history(step, batch)
         return checkpoint
+
+    def record_input_history(self, step: int | float, batch: Any) -> None:
+        """Retain a bounded per-step input so replay can cross checkpoint gaps."""
+        self._ensure_open()
+        if self._input_history_limit == 0:
+            return
+        replay = self._evidence.setdefault("replay", {})
+        history = replay.setdefault("input_history", [])
+        if not isinstance(history, list):
+            history = []
+            replay["input_history"] = history
+        encoded = batch
+        if not (isinstance(batch, Mapping) and ("artifact_sha256" in batch or "codec" in batch)):
+            try:
+                encoded = _replay_value(self, batch, name=f"history-{step}-batch")
+            except BaseException as exc:
+                self.record_capture_error("replay_input_history", exc)
+                return
+        history.append({"step": step, "batch": encoded})
+        if len(history) > self._input_history_limit:
+            del history[: len(history) - self._input_history_limit]
+            self._evict_unreferenced_payloads()
+
+    def record_replay_support(
+        self, providers: Mapping[str, Any] | None = None
+    ) -> Mapping[str, Any]:
+        """Record which training-state components can actually be restored."""
+        objects = dict(self._state_providers)
+        objects.update(dict(providers or {}))
+        model = objects.get("model")
+        support = {
+            "model_mode": _model_mode(model),
+            "gradients": _has_gradients(model),
+            "accumulation_state": objects.get("scaler") is not None,
+            "sampler_state": any(
+                key in objects for key in ("sampler", "batch_sampler", "dataloader")
+            ),
+            "autocast": _autocast_enabled(),
+        }
+        replay = self._evidence.setdefault("replay", {})
+        replay["supported_state"] = support
+        metadata = dict(self._run.metadata)
+        metadata["replay_support"] = support
+        self._run = replace(self._run, metadata=metadata)
+        return support
 
     def _evict_unreferenced_payloads(self) -> None:
         """Drop checkpoint payloads that are no longer referenced by evidence."""
@@ -971,10 +1133,8 @@ class CaptureContext:
         )
         self._closed = True
         self._capsule = self._assemble_capsule()
-        try:
-            _call(self._hooks, "on_finish", self._run)
-        except BaseException as exc:
-            self._capsule = self._minimal_capsule(None, exc)
+        self._record_hook_errors(_call(self._hooks, "on_finish", self._run))
+        self._refresh_capsule()
         self._persist_child_handoff(None)
         return self._capsule
 
@@ -1018,15 +1178,29 @@ class CaptureContext:
         )
         self._closed = True
         self._capsule = self._assemble_capsule(failure=failure)
-        try:
-            _call(self._hooks, "on_failure", failure)
-            _call(self._hooks, "on_finish", self._run)
-        except BaseException as hook_exc:
-            self._evidence.setdefault("capture_errors", {})["hook"] = (
-                f"{type(hook_exc).__name__}: {hook_exc}"
-            )
+        self._record_hook_errors(_call(self._hooks, "on_failure", failure))
+        self._record_hook_errors(_call(self._hooks, "on_finish", self._run))
+        self._refresh_capsule()
         self._persist_child_handoff(failure)
         return self._capsule
+
+    def _refresh_capsule(self) -> None:
+        """Include late hook/persistence diagnostics in the returned capsule."""
+        if self._capsule is None or not self._evidence:
+            return
+        try:
+            self._capsule = RunCapsule(
+                self._capsule.run,
+                self._capsule.artifacts,
+                self._capsule.payloads,
+                evidence=self._evidence,
+            )
+        except BaseException as exc:
+            # The incident is already represented by the assembled capsule;
+            # retain the secondary error rather than replacing that incident.
+            self._evidence.setdefault("capture_errors", {})["refresh"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
 
     def _persist_child_handoff(self, failure: FailureSignature | None) -> None:
         self._write_child_result(failure)
@@ -1039,9 +1213,8 @@ class CaptureContext:
         try:
             self._capsule.save(path, overwrite=True)
         except Exception as exc:
-            self._evidence.setdefault("capture_errors", {})["child_capsule"] = (
-                f"{type(exc).__name__}: {exc}"
-            )
+            self.record_capture_error("child_capsule", exc)
+            self._refresh_capsule()
 
     def _write_child_result(self, failure: FailureSignature | None) -> None:
         path = os.environ.get("MLFORENSICS_CHILD_RESULT")

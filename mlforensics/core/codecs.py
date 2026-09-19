@@ -108,6 +108,8 @@ class NumpyStateCodec:
     def encode(self, value: Any) -> EncodedState:
         if not self.can_encode(value):
             raise TypeError("numpy codec requires a numpy ndarray")
+        if getattr(getattr(value, "dtype", None), "kind", None) == "O":
+            raise TypeError("numpy object arrays are not portable state")
         flags = getattr(value, "flags", None)
         contiguous = value if getattr(flags, "c_contiguous", False) else value.copy()
         return EncodedState(
@@ -127,7 +129,13 @@ class NumpyStateCodec:
         shape = tuple(int(item) for item in metadata.get("shape", ()))
         if not dtype:
             raise ValueError("numpy state is missing dtype metadata")
-        array = np.frombuffer(payload, dtype=np.dtype(dtype)).copy()
+        selected_dtype = np.dtype(dtype)
+        expected = selected_dtype.itemsize
+        for dimension in shape:
+            expected *= dimension
+        if len(payload) != expected:
+            raise ValueError("numpy state payload size does not match dtype and shape")
+        array = np.frombuffer(payload, dtype=selected_dtype).copy()
         return array.reshape(shape)
 
 
@@ -185,7 +193,18 @@ class TorchStateCodec:
         dtype = getattr(torch, dtype_name.rsplit(".", 1)[-1], None)
         if dtype is None:
             raise ValueError(f"unsupported torch dtype metadata: {dtype_name}")
-        shape = tuple(int(item) for item in metadata.get("shape", ()))
+        raw_shape = metadata.get("shape", ())
+        try:
+            shape = tuple(int(item) for item in raw_shape)
+        except (TypeError, ValueError):
+            raise ValueError("torch state shape metadata is invalid") from None
+        if any(dimension < 0 for dimension in shape):
+            raise ValueError("torch state shape metadata is invalid")
+        expected = 1
+        for dimension in shape:
+            expected *= dimension
+        if len(payload) != expected * int(torch.empty((), dtype=dtype).element_size()):
+            raise ValueError("torch state payload size does not match dtype and shape")
         if not payload:
             tensor = torch.empty(shape, dtype=dtype)
         else:
@@ -391,7 +410,9 @@ def _decode_container(
         if codec_name == "bytes":
             return payload
         if codec_name == "json":
-            return json.loads(payload)
+            from .serialization import loads
+
+            return loads(payload)
         try:
             return registry.decode(codec_name, payload=payload, metadata=metadata)
         except KeyError as exc:

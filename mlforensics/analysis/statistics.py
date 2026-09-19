@@ -32,6 +32,13 @@ def finite_values(values: Iterable[float] | Any) -> list[float]:
     return clean
 
 
+def _finite_number(value: Any) -> bool:
+    try:
+        return not isinstance(value, bool) and math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def _identity_token(value: Any) -> str:
     """Return a deterministic token for a pairing identity.
 
@@ -56,21 +63,29 @@ def paired_observations(
 ) -> list[tuple[Any, Any, Any]]:
     """Pair observations by identity while retaining failed values in place.
 
-    When identities are omitted, the historical positional design is used.
-    Once identities are supplied, only equal identities are paired; values
-    with an identity present on one side are intentionally not matched to a
-    different observation on the other side.  Duplicate identities are
-    paired in occurrence order and remain visible to callers through the
-    returned identity value.
+    Pairing is an explicit experimental-design decision. If either side does
+    not provide identities, no pair is formed; in particular, filtering a
+    failed observation must never shift a later value into its place. Duplicate
+    identities are also rejected from paired inference by returning no pairs.
     """
 
     before = _as_list(baseline)
     after = _as_list(candidate)
-    old_ids = list(range(len(before))) if baseline_ids is None else list(baseline_ids)
-    new_ids = list(range(len(after))) if candidate_ids is None else list(candidate_ids)
+    if baseline_ids is None or candidate_ids is None:
+        if strict:
+            raise ValueError("paired inference requires explicit identities on both samples")
+        return []
+    old_ids = list(baseline_ids)
+    new_ids = list(candidate_ids)
     if len(old_ids) != len(before) or len(new_ids) != len(after):
         raise ValueError("observation identities must have the same length as their values")
-    if strict and baseline_ids is not None and candidate_ids is not None:
+    old_tokens = [_identity_token(value) for value in old_ids]
+    new_tokens = [_identity_token(value) for value in new_ids]
+    if len(set(old_tokens)) != len(old_tokens) or len(set(new_tokens)) != len(new_tokens):
+        if strict:
+            raise ValueError("paired samples must not contain duplicate observation identities")
+        return []
+    if strict:
         old_keys = {_identity_token(value) for value in old_ids}
         new_keys = {_identity_token(value) for value in new_ids}
         if old_keys != new_keys:
@@ -195,13 +210,16 @@ def paired_differences(
 ) -> list[float]:
     """Return candidate-minus-baseline differences for matched observations.
 
-    Failed/non-finite observations drop only their pair. Unequal lengths are
-    tolerated by default.  If identities are supplied, unequal or missing
-    identities are not shifted into a different pair; callers needing strict
-    experimental design can pass ``strict=True``.
+    Failed/non-finite observations drop only their explicitly matched pair.
+    Unequal lengths are tolerated by default, but identities are required on
+    both sides. If identities are supplied, unequal or missing identities are
+    not shifted into a different pair; callers needing strict experimental
+    design can pass ``strict=True``.
     """
     differences: list[float] = []
-    if strict and baseline_ids is None and candidate_ids is None:
+    if strict and (baseline_ids is None or candidate_ids is None):
+        raise ValueError("paired inference requires explicit identities on both samples")
+    if strict and baseline_ids is not None and candidate_ids is not None:
         before = _as_list(baseline)
         after = _as_list(candidate)
         if len(before) != len(after):
@@ -248,11 +266,20 @@ def paired_bootstrap(
 
 
 def effect_size(
-    values: Sequence[float], *, baseline: Sequence[float] | None = None
+    values: Sequence[float],
+    *,
+    baseline: Sequence[float] | None = None,
+    value_ids: Sequence[Any] | None = None,
+    baseline_ids: Sequence[Any] | None = None,
 ) -> float | None:
     clean = finite_values(values)
     if baseline is not None:
-        clean = paired_differences(baseline, values)
+        clean = paired_differences(
+            baseline,
+            values,
+            baseline_ids=baseline_ids,
+            candidate_ids=value_ids,
+        )
     if not clean:
         return None
     deviation = _statistics.stdev(clean) if len(clean) > 1 else 0.0
@@ -283,8 +310,16 @@ def regression_decision(
     therefore never fails a statistical gate.
     """
 
-    if delta is None or interval is None:
+    if not isinstance(higher_is_better, bool):
+        raise ValueError("higher_is_better must be a boolean")
+    if not _finite_number(practical_threshold) or practical_threshold < 0:
+        raise ValueError("practical_threshold must be a non-negative finite number")
+    if delta is None or not _finite_number(delta) or interval is None:
         return False, False, True
+    if not _finite_number(interval[0]) or not _finite_number(interval[1]):
+        return False, False, True
+    if interval[0] > interval[1]:
+        raise ValueError("confidence interval lower bound must not exceed upper bound")
     if higher_is_better:
         regression = interval[1] < -abs(practical_threshold)
         improvement = interval[0] > abs(practical_threshold)
@@ -302,8 +337,16 @@ def noninferiority_decision(
     margin: float = 0.0,
 ) -> bool:
     """Return whether the confidence interval rules out harm beyond ``margin``."""
+    if not isinstance(higher_is_better, bool):
+        raise ValueError("higher_is_better must be a boolean")
+    if not _finite_number(margin) or margin < 0:
+        raise ValueError("margin must be a non-negative finite number")
     if interval is None:
         return False
+    if not _finite_number(interval[0]) or not _finite_number(interval[1]):
+        return False
+    if interval[0] > interval[1]:
+        raise ValueError("confidence interval lower bound must not exceed upper bound")
     bound = interval[0] if higher_is_better else -interval[1]
     return bound >= -abs(margin)
 

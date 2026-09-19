@@ -1,9 +1,14 @@
+import subprocess
+from pathlib import Path
+
+from mlforensics.core import FailureSignature
 from mlforensics.core.contracts import PredicateResult
 from mlforensics.core.errors import UnresolvedEvaluation
 from mlforensics.diagnose.bisect import (
     BisectCache,
     RegressionStatus,
     StochasticBisector,
+    WorktreeGit,
     bisect_commits,
     decide_regression,
 )
@@ -168,3 +173,158 @@ def test_decide_regression_rejects_a_single_pair_and_serializes():
     encoded = json.dumps(decision.to_dict(), allow_nan=False)
     assert "NaN" not in encoded
     assert json.loads(encoded)["lower"] is None
+
+
+def test_bisect_cache_restores_failure_signatures_and_rejects_changed_identity(tmp_path):
+    path = tmp_path / "cache.json"
+    signature = FailureSignature.from_exception(ValueError("target"))
+    first = BisectCache(path=path)
+    first.set("rev", 11, signature, identity={"command": "one"})
+
+    loaded = BisectCache(path=path)
+    restored = loaded.get("rev", 11, identity={"command": "one"})
+    assert isinstance(restored, FailureSignature)
+    assert loaded.get("rev", 11, identity={"command": "two"}) is None
+
+
+def test_git_bisect_resumes_from_matching_cached_evidence(tmp_path):
+    class Git:
+        current = "good"
+
+        def commits(self, *args):
+            return ["good", "bad"]
+
+        def checkout(self, revision):
+            self.current = revision
+
+    cache = BisectCache(path=tmp_path / "cache.json")
+    git = Git()
+    first = bisect_commits(
+        git,
+        lambda seed: 0.0 if git.current == "good" else 10.0,
+        [11, 29, 37, 53, 71],
+        cache=cache,
+        command=["stable-harness"],
+    )
+
+    def fail_if_called(seed):
+        raise AssertionError("resume executed a cached run")
+
+    second = bisect_commits(
+        git,
+        fail_if_called,
+        [11, 29, 37, 53, 71],
+        cache=BisectCache(path=tmp_path / "cache.json"),
+        command=["stable-harness"],
+    )
+    assert first.first_bad == second.first_bad == "bad"
+    assert second.metadata["resumed"] is True
+    assert second.metadata["executed_runs"] == 0
+
+
+def test_git_bisect_requires_a_healthy_numeric_good_endpoint():
+    class Git:
+        current = "good"
+
+        def commits(self, *args):
+            return ["good", "bad"]
+
+        def checkout(self, revision):
+            self.current = revision
+
+    git = Git()
+    values = {11: 0.0, 29: None, 37: None, 53: None, 71: None}
+    report = bisect_commits(
+        git,
+        lambda seed: values[seed] if git.current == "good" else 10.0,
+        [11, 29, 37, 53, 71],
+    )
+    assert report.first_bad is None
+    assert report.evaluations[0].inconclusive
+    assert report.evaluations[0].metadata["reason"] == "insufficient observations"
+
+
+def test_git_bisect_budget_exhaustion_is_safe_and_reported():
+    class Git:
+        current = "good"
+
+        def commits(self, *args):
+            return ["good", "bad"]
+
+        def checkout(self, revision):
+            self.current = revision
+
+    git = Git()
+    report = bisect_commits(
+        git,
+        lambda seed: 0.0 if git.current == "good" else 10.0,
+        [11, 29, 37, 53, 71],
+        budget={"run_count": 2},
+    )
+    assert report.first_bad is None
+    assert report.metadata["budget_exhausted"] is True
+    assert report.metadata["executed_runs"] == 2
+
+
+def test_git_bisect_detects_nonmonotonic_history():
+    class Git:
+        current = "good"
+
+        def commits(self, *args):
+            return ["good", "bad-early", "good-again", "bad"]
+
+        def checkout(self, revision):
+            self.current = revision
+
+    git = Git()
+    scores = {"good": 0.0, "bad-early": 10.0, "good-again": 0.0, "bad": 10.0}
+    report = bisect_commits(
+        git,
+        lambda seed: scores[git.current],
+        [11, 29, 37, 53, 71],
+        detect_nonmonotonic=True,
+    )
+    assert report.first_bad is None
+    assert report.metadata["nonmonotonic"] is True
+    assert report.inconclusive == ["bad-early", "bad"]
+
+
+def test_worktree_bisect_isolated_runner_and_cleanup(tmp_path):
+    repository = tmp_path / "repo"
+    repository.mkdir()
+
+    def git(*args):
+        subprocess.run(
+            ["git", *args],
+            cwd=repository,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    (repository / "value.txt").write_text("0")
+    git("add", "value.txt")
+    git("commit", "-qm", "good")
+    good = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+    (repository / "value.txt").write_text("1")
+    git("commit", "-qam", "bad")
+    bad = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+    (repository / "local.txt").write_text("keep")
+
+    root = tmp_path / "worktrees"
+    worktree = WorktreeGit(repository, root=root)
+    report = bisect_commits(
+        worktree,
+        lambda seed, cwd: float((Path(cwd) / "value.txt").read_text()),
+        [11, 29, 37, 53, 71],
+        good=good,
+        bad=bad,
+        command=["read-value"],
+    )
+    assert report.first_bad == bad
+    assert (repository / "local.txt").read_text() == "keep"
+    assert worktree.working_directory == str(repository.resolve())
+    assert root.exists() and not list(root.iterdir())

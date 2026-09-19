@@ -1,4 +1,5 @@
 from mlforensics.analysis import performance_diff
+from mlforensics.core import ResourceSeries
 
 
 def test_latency_and_memory_regressions_are_detected():
@@ -77,3 +78,25 @@ def test_single_sample_resource_is_compared_against_an_explicit_budget():
         thresholds={"peak_rss": 0.1},
     )
     assert not within.metric("peak_rss").regression
+
+
+def test_resource_pairing_never_uses_positions_when_identities_are_absent():
+    result = performance_diff(
+        {"latency_ms": [10, 20]},
+        {"latency_ms": [11, 21, 31]},
+        n_resamples=50,
+    )
+    metric = result.metric("latency_ms")
+    assert metric.metadata["pairing"] == "independent"
+    assert metric.metadata["shared_observations"] == 0
+
+
+def test_duplicate_resource_identities_are_not_counted_as_repetitions():
+    baseline = ResourceSeries("latency_ms", [10, 10], identities=["trial", "trial"])
+    candidate = ResourceSeries("latency_ms", [20, 20], identities=["trial", "trial"])
+    result = performance_diff({"latency_ms": baseline}, {"latency_ms": candidate}, n_resamples=50)
+    metric = result.metric("latency_ms")
+    assert metric.metadata["pairing"] == "ambiguous"
+    assert metric.metadata["pairing_valid"] is False
+    assert metric.sample_size == 0
+    assert not metric.regression

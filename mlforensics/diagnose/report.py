@@ -27,16 +27,18 @@ class DiagnosisReport(Report):
 
 
 def as_dict(value: Any) -> Any:
+    # Prefer a record's explicit wire representation. ``dataclasses.asdict``
+    # would erase the type/schema markers carried by core evidence records.
+    if hasattr(value, "to_dict") and not isinstance(value, (str, bytes, Report)):
+        return as_dict(value.to_dict())
     if dataclasses.is_dataclass(value):
-        return {k: as_dict(v) for k, v in dataclasses.asdict(value).items()}
+        return {item.name: as_dict(getattr(value, item.name)) for item in dataclasses.fields(value)}
     if isinstance(value, Mapping):
         return {str(k): as_dict(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [as_dict(v) for v in value]
     if hasattr(value, "value") and isinstance(getattr(value, "value"), str):
         return value.value
-    if hasattr(value, "to_dict") and not isinstance(value, (str, bytes)):
-        return value.to_dict()
     return value
 
 

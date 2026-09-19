@@ -22,6 +22,18 @@ def _finite_number(value: Any) -> bool:
         return False
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 def _default_higher_is_better(name: str) -> bool:
     normalized = name.casefold().replace("-", "_")
     return any(
@@ -45,21 +57,23 @@ class PerformanceMetric:
     sample_size: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "baseline": self.baseline,
-            "candidate": self.candidate,
-            "delta": self.delta,
-            "relative_delta": self.relative_delta,
-            "units": self.units,
-            "regression": self.regression,
-            "metadata": self.metadata,
-            "confidence_interval": (
-                list(self.confidence_interval) if self.confidence_interval is not None else None
-            ),
-            "confidence": self.confidence,
-            "sample_size": self.sample_size,
-        }
+        return _json_safe(
+            {
+                "name": self.name,
+                "baseline": self.baseline,
+                "candidate": self.candidate,
+                "delta": self.delta,
+                "relative_delta": self.relative_delta,
+                "units": self.units,
+                "regression": self.regression,
+                "metadata": self.metadata,
+                "confidence_interval": (
+                    list(self.confidence_interval) if self.confidence_interval is not None else None
+                ),
+                "confidence": self.confidence,
+                "sample_size": self.sample_size,
+            }
+        )
 
     @property
     def is_regression(self) -> bool:
@@ -73,11 +87,13 @@ class PerformanceDiff:
     configuration_changes: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "metrics": [item.to_dict() for item in self.metrics],
-            "likely_contributors": self.likely_contributors,
-            "configuration_changes": self.configuration_changes,
-        }
+        return _json_safe(
+            {
+                "metrics": [item.to_dict() for item in self.metrics],
+                "likely_contributors": self.likely_contributors,
+                "configuration_changes": self.configuration_changes,
+            }
+        )
 
     @property
     def has_regression(self) -> bool:
@@ -131,15 +147,8 @@ def _identity_token(value: Any) -> str:
         return repr(value)
 
 
-def _sample_ids(value: Any, count: int) -> tuple[Any, ...]:
-    explicit = getattr(value, "observation_ids", None)
-    if explicit is not None:
-        try:
-            ids = tuple(explicit() if callable(explicit) else explicit)
-            if len(ids) == count:
-                return ids
-        except (TypeError, ValueError):
-            pass
+def _sample_ids(value: Any, count: int) -> tuple[Any, ...] | None:
+    """Return producer-supplied identities, never a generated position list."""
     raw = getattr(value, "identities", ())
     if raw:
         ids = tuple(raw)
@@ -156,16 +165,80 @@ def _sample_ids(value: Any, count: int) -> tuple[Any, ...]:
     steps = getattr(value, "steps", ())
     if steps and len(steps) == count:
         return tuple(steps)
-    return tuple(range(count))
+    # Legacy adapters may expose only observation_ids. Core MetricSeries and
+    # ResourceSeries expose a generated range through that property, so only
+    # consult it for objects that do not have the core identities field.
+    if not hasattr(value, "identities"):
+        explicit = getattr(value, "observation_ids", None)
+        if explicit is not None:
+            try:
+                ids = tuple(explicit() if callable(explicit) else explicit)
+                if len(ids) == count:
+                    return ids
+            except (TypeError, ValueError):
+                pass
+    return None
 
 
 def _aligned_finite_samples(
     baseline: Any, candidate: Any
-) -> tuple[list[float], list[float], dict[str, int]]:
+) -> tuple[list[float], list[float], dict[str, Any]]:
     old_raw = _raw_values(baseline)
     new_raw = _raw_values(candidate)
     old_ids = _sample_ids(baseline, len(old_raw))
     new_ids = _sample_ids(candidate, len(new_raw))
+    old_finite = _values(baseline)
+    new_finite = _values(candidate)
+    if old_ids is None and new_ids is None:
+        return (
+            old_finite,
+            new_finite,
+            {
+                "baseline_observations": len(old_raw),
+                "candidate_observations": len(new_raw),
+                "shared_observations": 0,
+                "unpaired_baseline_observations": len(old_raw),
+                "unpaired_candidate_observations": len(new_raw),
+                "baseline_nonfinite": sum(not _finite_number(v) for v in old_raw),
+                "candidate_nonfinite": sum(not _finite_number(v) for v in new_raw),
+                "pairing": "independent",
+                "pairing_valid": True,
+            },
+        )
+    if old_ids is None or new_ids is None:
+        return (
+            [],
+            [],
+            {
+                "baseline_observations": len(old_raw),
+                "candidate_observations": len(new_raw),
+                "shared_observations": 0,
+                "unpaired_baseline_observations": len(old_raw),
+                "unpaired_candidate_observations": len(new_raw),
+                "baseline_nonfinite": sum(not _finite_number(v) for v in old_raw),
+                "candidate_nonfinite": sum(not _finite_number(v) for v in new_raw),
+                "pairing": "incompatible",
+                "pairing_valid": False,
+            },
+        )
+    old_tokens = [_identity_token(identity) for identity in old_ids]
+    new_tokens = [_identity_token(identity) for identity in new_ids]
+    if len(set(old_tokens)) != len(old_tokens) or len(set(new_tokens)) != len(new_tokens):
+        return (
+            [],
+            [],
+            {
+                "baseline_observations": len(old_raw),
+                "candidate_observations": len(new_raw),
+                "shared_observations": 0,
+                "unpaired_baseline_observations": len(old_raw),
+                "unpaired_candidate_observations": len(new_raw),
+                "baseline_nonfinite": sum(not _finite_number(v) for v in old_raw),
+                "candidate_nonfinite": sum(not _finite_number(v) for v in new_raw),
+                "pairing": "ambiguous",
+                "pairing_valid": False,
+            },
+        )
     buckets: dict[str, list[Any]] = {}
     for identity, value in zip(new_ids, new_raw):
         buckets.setdefault(_identity_token(identity), []).append(value)
@@ -186,6 +259,7 @@ def _aligned_finite_samples(
             if math.isfinite(old_number) and math.isfinite(new_number):
                 old.append(old_number)
                 new.append(new_number)
+    pairing_valid = bool(shared and old and new)
     return (
         old,
         new,
@@ -197,6 +271,8 @@ def _aligned_finite_samples(
             "unpaired_candidate_observations": len(new_raw) - shared,
             "baseline_nonfinite": sum(not _finite_number(v) for v in old_raw),
             "candidate_nonfinite": sum(not _finite_number(v) for v in new_raw),
+            "pairing": "stable_identity",
+            "pairing_valid": pairing_valid,
         },
     )
 
@@ -263,9 +339,9 @@ def _bootstrap_delta_interval(
     confidence: float,
     n_resamples: int,
     seed: int,
+    paired: bool,
 ) -> tuple[float, float]:
     rng = random.Random(seed)
-    paired = len(before) == len(after)
     distribution: list[float] = []
     for _ in range(n_resamples):
         if paired:
@@ -331,6 +407,8 @@ def performance_diff(
     if any(not _finite_number(value) for value in thresholds.values()):
         raise ValueError("performance thresholds must be finite numbers")
     thresholds = {name: float(value) for name, value in thresholds.items()}
+    if any(value < 0 for value in thresholds.values()):
+        raise ValueError("performance thresholds must be non-negative")
     if any(not isinstance(value, bool) for value in higher_is_better.values()):
         raise ValueError("higher_is_better values must be booleans")
     if required_names is None:
@@ -366,9 +444,14 @@ def performance_diff(
         # Resampling a single observation cannot describe variability: it yields a
         # zero-width interval that excludes zero for any non-zero delta, which
         # would report every run-to-run wobble as a significant regression.
-        if min(len(old_values), len(new_values)) >= minimum_observations and before not in (
-            None,
-            0,
+        if (
+            pairing["pairing_valid"]
+            and min(len(old_values), len(new_values)) >= minimum_observations
+            and before
+            not in (
+                None,
+                0,
+            )
         ):
             delta_interval = _bootstrap_delta_interval(
                 old_values,
@@ -377,18 +460,19 @@ def performance_diff(
                 confidence=confidence,
                 n_resamples=n_resamples,
                 seed=seed + index,
+                paired=pairing["pairing"] == "stable_identity",
             )
             interval = tuple(value / abs(before) for value in delta_interval)
         if interval is not None:
             evidence_mode = "interval"
             regression = bool(interval[1] < -abs(limit) if beneficial else interval[0] > abs(limit))
-        elif configured and relative is not None:
+        elif configured and relative is not None and pairing["pairing_valid"]:
             # Too few observations to infer, but the caller declared an explicit
             # budget, so compare the point estimate against that budget instead.
             evidence_mode = "threshold"
             regression = relative < -abs(limit) if beneficial else relative > abs(limit)
         else:
-            evidence_mode = "none"
+            evidence_mode = "invalid" if not pairing["pairing_valid"] else "none"
             regression = False
         item = PerformanceMetric(
             name,
@@ -407,7 +491,7 @@ def performance_diff(
                 "candidate_samples": len(new_values),
                 "minimum_observations": minimum_observations,
                 "insufficient_evidence": evidence_mode == "none",
-                "pairing": "stable_identity",
+                "pairing_valid": pairing["pairing_valid"],
                 **pairing,
             },
             confidence_interval=interval,

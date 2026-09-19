@@ -9,6 +9,8 @@ import os
 import random
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
@@ -1032,10 +1034,179 @@ def _portable_rng_snapshot() -> dict[str, Any]:
     torch = sys.modules.get("torch")
     if torch is not None:
         try:
-            states["torch_cpu"] = torch.random.get_rng_state().tolist()
-        except Exception:
-            pass
+            random_module = getattr(torch, "random", torch)
+            cpu_state = random_module.get_rng_state()
+            tolist = getattr(cpu_state, "tolist", None)
+            states["torch_cpu"] = tolist() if callable(tolist) else cpu_state
+        except Exception as exc:
+            states["torch_cpu_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            cuda = getattr(torch, "cuda", None)
+            if cuda is not None and callable(getattr(cuda, "is_available", None)):
+                if cuda.is_available():
+                    get_all = getattr(cuda, "get_rng_state_all", None)
+                    if callable(get_all):
+                        states["torch_cuda"] = [
+                            getattr(state, "tolist", lambda: state)() for state in get_all()
+                        ]
+                    else:
+                        states["torch_cuda_error"] = "CUDA RNG provider is unavailable"
+        except Exception as exc:
+            states["torch_cuda_error"] = f"{type(exc).__name__}: {exc}"
     return json_safe(states)
+
+
+def _torch_metadata(torch: Any, model: Any = None) -> dict[str, Any]:
+    """Describe a loaded/provided PyTorch module without importing PyTorch.
+
+    ``torch`` is deliberately supplied by the caller (or obtained from
+    ``sys.modules``). This keeps the base capture path usable when PyTorch is
+    not installed, while still making a loaded module useful for replay.
+    """
+
+    if torch is None:
+        return {
+            "available": False,
+            "status": "omitted",
+            "reason": "PyTorch is not installed or has not been imported",
+        }
+
+    result: dict[str, Any] = {
+        "available": True,
+        "status": "captured",
+        "version": getattr(torch, "__version__", None),
+    }
+    cuda = getattr(torch, "cuda", None)
+    cuda_available = False
+    if cuda is not None:
+        try:
+            available = getattr(cuda, "is_available", None)
+            cuda_available = bool(available()) if callable(available) else False
+        except Exception as exc:
+            result["cuda_error"] = f"{type(exc).__name__}: {exc}"
+        result["cuda_available"] = cuda_available
+        if cuda_available:
+            try:
+                count = getattr(cuda, "device_count", lambda: 0)()
+                result["cuda_device_count"] = int(count)
+                devices = []
+                for index in range(int(count)):
+                    item: dict[str, Any] = {"index": index}
+                    get_name = getattr(cuda, "get_device_name", None)
+                    if callable(get_name):
+                        item["name"] = str(get_name(index))
+                    get_capability = getattr(cuda, "get_device_capability", None)
+                    if callable(get_capability):
+                        item["capability"] = json_safe(get_capability(index))
+                    devices.append(item)
+                result["cuda_devices"] = devices
+            except Exception as exc:
+                result["cuda_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        result["cuda_available"] = False
+
+    def call(name: str, default: Any = None) -> Any:
+        function = getattr(torch, name, None)
+        if not callable(function):
+            return default
+        try:
+            return json_safe(function())
+        except Exception as exc:
+            result[f"{name}_error"] = f"{type(exc).__name__}: {exc}"
+            return default
+
+    deterministic = call("are_deterministic_algorithms_enabled")
+    if deterministic is not None:
+        result["deterministic_algorithms"] = bool(deterministic)
+    backends = getattr(torch, "backends", None)
+    cudnn = getattr(backends, "cudnn", None) if backends is not None else None
+    if cudnn is not None:
+        for name in ("deterministic", "benchmark", "allow_tf32"):
+            if hasattr(cudnn, name):
+                result[f"cudnn_{name}"] = bool(getattr(cudnn, name))
+
+    autocast: dict[str, Any] = {}
+    enabled = call("is_autocast_enabled")
+    amp = getattr(torch, "amp", None)
+    if enabled is None and amp is not None:
+        function = getattr(amp, "is_autocast_enabled", None)
+        if callable(function):
+            try:
+                enabled = bool(function())
+            except Exception as exc:
+                result["autocast_error"] = f"{type(exc).__name__}: {exc}"
+    if enabled is not None:
+        autocast["enabled"] = bool(enabled)
+    autocast_dtype = getattr(torch, "get_autocast_dtype", None)
+    for name, key, device in (
+        ("get_autocast_cpu_dtype", "cpu_dtype", "cpu"),
+        ("get_autocast_gpu_dtype", "gpu_dtype", "cuda"),
+        ("is_autocast_cache_enabled", "cache_enabled", None),
+    ):
+        if device is not None and callable(autocast_dtype):
+            try:
+                value = json_safe(autocast_dtype(device))
+            except Exception as exc:
+                result[f"{name}_error"] = f"{type(exc).__name__}: {exc}"
+                value = None
+        else:
+            value = call(name)
+        if value is not None:
+            autocast[key] = str(value) if "dtype" in key else bool(value)
+    if autocast:
+        result["autocast"] = autocast
+
+    if model is not None:
+        model_info: dict[str, Any] = {
+            "type": f"{type(model).__module__}.{type(model).__qualname__}",
+        }
+        if isinstance(getattr(model, "training", None), bool):
+            model_info["training"] = model.training
+        parameters = getattr(model, "parameters", None)
+        if callable(parameters):
+            try:
+                parameter_list = list(parameters())
+                model_info["parameter_count"] = sum(
+                    int(parameter.numel())
+                    for parameter in parameter_list
+                    if callable(getattr(parameter, "numel", None))
+                )
+                model_info["trainable_parameter_count"] = sum(
+                    int(parameter.numel())
+                    for parameter in parameter_list
+                    if getattr(parameter, "requires_grad", False)
+                    and callable(getattr(parameter, "numel", None))
+                )
+                devices = sorted(
+                    {
+                        str(getattr(parameter, "device"))
+                        for parameter in parameter_list
+                        if getattr(parameter, "device", None) is not None
+                    }
+                )
+                dtypes = sorted(
+                    {
+                        str(getattr(parameter, "dtype"))
+                        for parameter in parameter_list
+                        if getattr(parameter, "dtype", None) is not None
+                    }
+                )
+                if devices:
+                    model_info["devices"] = devices
+                if dtypes:
+                    model_info["dtypes"] = dtypes
+            except Exception as exc:
+                model_info["state_limitation"] = {
+                    "status": "incompatible",
+                    "reason": f"could not inspect model parameters: {type(exc).__name__}: {exc}",
+                }
+        else:
+            model_info["state_limitation"] = {
+                "status": "incompatible",
+                "reason": "model does not expose a parameters() method",
+            }
+        result["model"] = model_info
+    return result
 
 
 class CaptureContext(AbstractContextManager):
@@ -1049,13 +1220,221 @@ class CaptureContext(AbstractContextManager):
         environ: Mapping[str, str] | None = None,
         capsule: Any | None = None,
         use_core_capsule: bool = True,
+        metadata: Mapping[str, Any] | None = None,
+        model: Any | None = None,
+        torch_metadata: bool | Mapping[str, Any] | Any | None = None,
+        torch_module: Any | None = None,
+        capture_torch_metadata: bool | None = None,
+        state_providers: Mapping[str, Any] | None = None,
+        checkpoint_limit: int = 3,
+        checkpoint_window: int | Mapping[str, Any] | None = None,
     ) -> None:
+        if (
+            isinstance(checkpoint_limit, bool)
+            or not isinstance(checkpoint_limit, int)
+            or checkpoint_limit < 0
+        ):
+            raise ValueError("checkpoint_limit must be a non-negative integer")
+        if checkpoint_window is not None:
+            if isinstance(checkpoint_window, bool) or isinstance(checkpoint_window, int):
+                if checkpoint_window < 0:
+                    raise ValueError("checkpoint_window must be a non-negative integer")
+                checkpoint_limit = checkpoint_window
+            elif not isinstance(checkpoint_window, Mapping):
+                raise TypeError("checkpoint_window must be an integer, mapping, or None")
         self.repo_path = repo_path
         self.data_paths = data_paths
         self.env_allowlist = env_allowlist
         self.environ = environ
         self.capsule = capsule if capsule is not None else PortableRunCapsule()
+        self.metadata = dict(metadata or {})
+        self.model = model
+        self._torch_module = torch_module
+        self._torch_requested = bool(capture_torch_metadata)
+        if torch_metadata is not None:
+            if isinstance(torch_metadata, bool):
+                self._torch_requested = torch_metadata
+            elif isinstance(torch_metadata, Mapping):
+                self._torch_requested = True
+                configured = self.metadata.setdefault("pytorch", {})
+                if not isinstance(configured, dict):
+                    configured = {}
+                    self.metadata["pytorch"] = configured
+                configured.update(dict(torch_metadata))
+            else:
+                # A model is a useful shorthand and keeps older integrations
+                # from needing to know the name of the optional argument.
+                self.model = torch_metadata
+                self._torch_requested = True
+        self._state_providers = dict(state_providers or {})
+        self._checkpoint_limit = checkpoint_limit
+        self._checkpoint_window_overrides = (
+            dict(checkpoint_window) if isinstance(checkpoint_window, Mapping) else {}
+        )
+        self._checkpoints: list[dict[str, Any]] = []
+        self._limitations: list[dict[str, Any]] = []
+        self._timeout: dict[str, Any] | None = None
         self._captured = False
+
+    def _limitation(
+        self,
+        component: str,
+        reason: str,
+        *,
+        status: str = "omitted",
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Retain a machine-readable explanation for missing evidence."""
+        item = {"component": str(component), "status": str(status), "reason": str(reason)}
+        if details:
+            item["details"] = json_safe(dict(details))
+        if item not in self._limitations:
+            self._limitations.append(item)
+
+    def _write_limitations(self) -> None:
+        manifest = getattr(self.capsule, "manifest", None)
+        if isinstance(manifest, dict):
+            manifest["limitations"] = list(self._limitations)
+
+    @staticmethod
+    def _snapshot_provider(provider: Any) -> Any:
+        snapshot = getattr(provider, "snapshot", None)
+        if callable(snapshot):
+            return snapshot()
+        state_dict = getattr(provider, "state_dict", None)
+        if callable(state_dict):
+            return state_dict()
+        if callable(provider):
+            return provider()
+        return provider
+
+    def _capture_registered_state(self) -> None:
+        for name, provider in self._state_providers.items():
+            try:
+                value = self._snapshot_provider(provider)
+                safe = json_safe(value)
+                json.dumps(safe, allow_nan=False)
+                self.record_state(str(name), safe)
+            except BaseException as exc:
+                self._limitation(
+                    f"state:{name}",
+                    f"state provider could not be captured: {type(exc).__name__}: {exc}",
+                    status="incompatible",
+                )
+
+    def record_state(self, name: str, state: Any) -> Any:
+        """Record a JSON-safe state snapshot, or a structured limitation."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("state name must be a non-empty string")
+        try:
+            safe = json_safe(state)
+            json.dumps(safe, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            self._limitation(
+                f"state:{name}",
+                f"state is not JSON-compatible: {type(exc).__name__}: {exc}",
+                status="incompatible",
+            )
+            return None
+        manifest = getattr(self.capsule, "manifest", None)
+        if isinstance(manifest, dict):
+            manifest.setdefault("state", {})[str(name)] = safe
+        return safe
+
+    snapshot_state = record_state
+
+    def record_checkpoint(
+        self,
+        step: int | float,
+        *,
+        state_providers: Mapping[str, Any] | None = None,
+        batch: Any = None,
+        epoch: int | None = None,
+        sampler_position: int | None = None,
+        sample_ids: Sequence[Any] | None = None,
+        before_step: bool = True,
+    ) -> Mapping[str, Any]:
+        """Record a bounded, metadata-only checkpoint window.
+
+        The compatibility capsule does not own the binary state codecs used by
+        the core context. It therefore records JSON-safe state plus explicit
+        incompatibility details rather than pretending unsupported objects are
+        replayable.
+        """
+        if (
+            isinstance(step, bool)
+            or not isinstance(step, (int, float))
+            or not math.isfinite(float(step))
+        ):
+            raise ValueError("checkpoint step must be a finite number")
+        if self._checkpoint_limit == 0:
+            self._limitation("checkpoints", "checkpoint window is disabled")
+            return {"step": step, "stored": False, "reason": "checkpoint_limit=0"}
+        errors: dict[str, str] = {}
+        state: dict[str, Any] = {}
+        providers = self._state_providers if state_providers is None else state_providers
+        for name, provider in providers.items():
+            try:
+                value = self._snapshot_provider(provider)
+                safe = json_safe(value)
+                json.dumps(safe, allow_nan=False)
+                state[str(name)] = safe
+            except BaseException as exc:
+                errors[str(name)] = f"{type(exc).__name__}: {exc}"
+                self._limitation(f"checkpoint:{name}", errors[str(name)], status="incompatible")
+        portable_batch = None
+        if batch is not None:
+            try:
+                portable_batch = json_safe(batch)
+                json.dumps(portable_batch, allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                errors["__batch__"] = f"{type(exc).__name__}: {exc}"
+                self._limitation("checkpoint:batch", errors["__batch__"], status="incompatible")
+        portable_sample_ids = None
+        if sample_ids is not None:
+            try:
+                portable_sample_ids = json_safe(list(sample_ids))
+                json.dumps(portable_sample_ids, allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                errors["__sample_ids__"] = f"{type(exc).__name__}: {exc}"
+                self._limitation(
+                    "checkpoint:sample_ids", errors["__sample_ids__"], status="incompatible"
+                )
+        checkpoint = {
+            "checkpoint_id": (
+                f"{getattr(self.capsule, 'run_id', 'run')}:{step}:{len(self._checkpoints)}"
+            ),
+            "step": step,
+            "before_step": bool(before_step),
+            "state": state,
+            "batch": portable_batch,
+            "epoch": epoch,
+            "sampler_position": sampler_position,
+            "sample_ids": portable_sample_ids,
+            "state_capture_errors": errors,
+        }
+        self._checkpoints.append(checkpoint)
+        if len(self._checkpoints) > self._checkpoint_limit:
+            del self._checkpoints[: len(self._checkpoints) - self._checkpoint_limit]
+        manifest = getattr(self.capsule, "manifest", None)
+        if isinstance(manifest, dict):
+            manifest["checkpoints"] = list(self._checkpoints)
+        return checkpoint
+
+    checkpoint_before_step = record_checkpoint
+
+    def _checkpoint_metadata(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "limit": self._checkpoint_limit,
+            "retained": len(self._checkpoints),
+            "available": bool(self._checkpoints),
+            "status": "captured" if self._checkpoints else "omitted",
+        }
+        if self._checkpoints:
+            result["first_step"] = self._checkpoints[0]["step"]
+            result["last_step"] = self._checkpoints[-1]["step"]
+        result.update(json_safe(self._checkpoint_window_overrides))
+        return result
 
     def _section(self, name: str, producer: Any) -> None:
         try:
@@ -1083,6 +1462,7 @@ class CaptureContext(AbstractContextManager):
             "data_labels": sorted(str(key) for key in self.data_paths)
             if isinstance(self.data_paths, Mapping)
             else (["data"] if self.data_paths is not None else []),
+            "metadata": json_safe(self.metadata),
         }
         record_on_capsule(self.capsule, "manifest", manifest)
         self._section(
@@ -1105,6 +1485,28 @@ class CaptureContext(AbstractContextManager):
         self._section("dependencies", inventory_dependencies)
         self._section("data_fingerprints", self._capture_data)
         self._section("rng_snapshots", _portable_rng_snapshot)
+        torch = self._torch_module if self._torch_module is not None else sys.modules.get("torch")
+        if torch is None:
+            if self._torch_requested or self.model is not None:
+                self._limitation("pytorch", "PyTorch is not installed or has not been imported")
+        else:
+            record_on_capsule(
+                self.capsule,
+                "hardware",
+                {"pytorch": _torch_metadata(torch, self.model)},
+            )
+        if self.model is not None and torch is None:
+            self._limitation("model", "model metadata requires the optional PyTorch module")
+        if self._state_providers:
+            self._capture_registered_state()
+        else:
+            self._limitation("application_state", "no state providers were supplied")
+        if self._checkpoint_limit == 0:
+            self._limitation("checkpoints", "checkpoint window is disabled")
+        self._write_limitations()
+        manifest = getattr(self.capsule, "manifest", None)
+        if isinstance(manifest, dict):
+            manifest["checkpoint_window"] = self._checkpoint_metadata()
         self._captured = True
         return self.capsule
 
@@ -1120,7 +1522,46 @@ class CaptureContext(AbstractContextManager):
     metric = record_metric
 
     def record_exception(self, exception: BaseException, where: str | None = None) -> None:
-        record_exception_on_capsule(self.capsule, exception, where)
+        try:
+            record_exception_on_capsule(self.capsule, exception, where)
+        except BaseException as capture_error:
+            self._limitation(
+                "exception",
+                f"exception record failed: {type(capture_error).__name__}: {capture_error}",
+                status="incompatible",
+            )
+
+    def record_timeout(self, seconds: float | None = None, where: str = "workload") -> None:
+        """Record a timeout without losing the surrounding capture state."""
+        if seconds is not None and (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, (int, float))
+            or not math.isfinite(float(seconds))
+            or seconds <= 0
+        ):
+            raise ValueError("timeout seconds must be a positive finite number or None")
+        self._timeout = {"seconds": seconds, "where": where}
+        exceptions = getattr(self.capsule, "exceptions", None)
+        entry = {
+            "type": "TimeoutError",
+            "module": "builtins",
+            "message": "operation timed out",
+            "kind": "timeout",
+            "where": where,
+            "seconds": seconds,
+        }
+        if isinstance(exceptions, list):
+            exceptions.append(entry)
+        else:
+            self.record_exception(TimeoutError("operation timed out"), where=where)
+        manifest = getattr(self.capsule, "manifest", None)
+        if isinstance(manifest, dict):
+            manifest["timeout"] = dict(self._timeout)
+            manifest["failure"] = {
+                "kind": "timeout",
+                "type": "builtins.TimeoutError",
+                "message": "operation timed out",
+            }
 
     def fingerprint(self, name: str, path: Any) -> Any:
         result = content_fingerprint(path)
@@ -1138,6 +1579,24 @@ class CaptureContext(AbstractContextManager):
         snapshots = getattr(self.capsule, "rng_snapshots", None)
         if isinstance(snapshots, dict):
             snapshots["end"] = _portable_rng_snapshot()
+        manifest = getattr(self.capsule, "manifest", None)
+        if isinstance(manifest, dict):
+            manifest["status"] = (
+                "failed"
+                if exc_value is not None
+                else "timeout"
+                if self._timeout is not None
+                else "succeeded"
+            )
+            if exc_value is not None:
+                manifest["failure"] = {
+                    "kind": "exception",
+                    "type": f"{type(exc_value).__module__}.{type(exc_value).__qualname__}",
+                    "message": str(exc_value),
+                }
+            manifest["ended_at"] = utc_now()
+            manifest["checkpoint_window"] = self._checkpoint_metadata()
+        self._write_limitations()
         return False
 
 
@@ -1148,11 +1607,47 @@ class CaptureRunner:
         self,
         context: CaptureContext | None = None,
         raise_exceptions: bool = True,
+        timeout: float | None = None,
         **context_kwargs: Any,
     ) -> None:
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or timeout <= 0
+        ):
+            raise ValueError("timeout must be a positive finite number or None")
+        self.timeout = float(timeout) if timeout is not None else None
         self.context = context or CaptureContext(**context_kwargs)
         self.raise_exceptions = raise_exceptions
         self.result: Any = None
+
+    def _call_with_timeout(
+        self, function: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> Any:
+        if self.timeout is None:
+            return function(*args, **kwargs)
+        outcome: dict[str, Any] = {}
+
+        def invoke() -> None:
+            try:
+                outcome["result"] = function(*args, **kwargs)
+            except BaseException as exc:
+                outcome["exception"] = exc
+
+        worker = threading.Thread(target=invoke, name="mlforensics-capture", daemon=True)
+        started = time.monotonic()
+        worker.start()
+        worker.join(self.timeout)
+        if worker.is_alive():
+            self.context.record_timeout(self.timeout)
+            return None
+        if "exception" in outcome:
+            raise outcome["exception"]
+        self.context.metadata.setdefault("timing", {})["elapsed_seconds"] = (
+            time.monotonic() - started
+        )
+        return outcome.get("result")
 
     @property
     def capsule(self) -> Any:
@@ -1170,8 +1665,8 @@ class CaptureRunner:
                 if isinstance(metrics, Mapping):
                     for name, value in metrics.items():
                         active.record_metric(name, value)
-                self.result = function(*args, **kwargs)
-                if callable(metrics):
+                self.result = self._call_with_timeout(function, args, kwargs)
+                if callable(metrics) and getattr(self.context, "_timeout", None) is None:
                     for name, value in metrics(self.result).items():
                         active.record_metric(name, value)
         except BaseException:

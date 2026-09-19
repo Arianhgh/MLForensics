@@ -1,5 +1,7 @@
 import pytest
 
+from mlforensics import FailureSignature
+from mlforensics.core.contracts import PredicateResult
 from mlforensics.diagnose.shrink import InitialPredicateError, shrink, shrink_columns
 
 
@@ -68,3 +70,49 @@ def test_structured_shrinking_removes_noise_and_simplifies_values():
     )
     assert report.value == {"request": {"token": "bad"}}
     assert report.metadata["verified"] is True
+
+
+def test_typed_failure_signature_must_match_the_source_incident():
+    expected = FailureSignature.from_exception(ValueError("target"))
+
+    def different(_value):
+        return FailureSignature.from_exception(KeyError("other"))
+
+    with pytest.raises(InitialPredicateError, match="signature mismatch"):
+        shrink(["input"], different, kind="sequence", expected_failure=expected)
+
+    matching = shrink(
+        ["noise", "input"],
+        lambda value: (
+            PredicateResult(
+                preserved=True,
+                status="fail",
+                actual=expected,
+            )
+            if "input" in value
+            else PredicateResult(preserved=False, status="pass")
+        ),
+        kind="sequence",
+        expected_failure=expected,
+    )
+    assert matching.value == ["input"]
+    assert matching.metadata["signature_checks"] > 0
+
+
+def test_candidate_cache_quorum_and_evaluation_budget_are_reported():
+    calls = 0
+
+    def predicate(value):
+        nonlocal calls
+        calls += 1
+        return 9 in value
+
+    report = shrink([0, 0, 9, 0], predicate, kind="sequence", max_evaluations=3)
+    assert calls == report.evaluations * 1
+    assert report.metadata["cached_candidates"] == report.evaluations
+    assert report.metadata["budget_exhausted"] is True
+
+    trials = iter((True, False, True))
+    quorum = shrink([1], lambda _value: next(trials), kind="sequence", trials=3, quorum=2)
+    assert quorum.value == [1]
+    assert quorum.metadata["flaky_candidates"] == 1

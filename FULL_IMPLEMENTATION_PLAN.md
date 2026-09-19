@@ -9,10 +9,17 @@ the documented workflow is incomplete. **Open** means not yet implemented.
 
 | Phase | Status | Dependency | Acceptance evidence |
 | --- | --- | --- | --- |
-| 0 Correctness recovery | Partial | none | Remaining evidence bugs are tracked as P0.1–P0.7 in the updated remaining-work plan. Codec envelopes, reduced-input replay, structured-failure matching, RNG restore order, index locking, and minimum-evidence JSON serialization have in-tree tests. |
-| 1 Capsules, capture, execution | Partial | Phase 0 | Atomic capsule writes, config key validation, local run index, metadata-only load, `capture_training` |
-| 2 PyTorch debugging demo | Partial | Phases 0–1 | `tests/diagnose/test_pytorch_workflow.py` (CPU attention NaN: capture → replay → shrink → trace). Fixture Git history and packaged demo remain open. |
-| 3–9 Later product phases | Open | prior phases | See sections below. |
+| 0 Correctness recovery | Done | none | 296 tests cover group-wide CI aggregation, explicit pairing identities, sparse-replay gap rejection plus intervening-step execution, restoration status, codec envelopes, reduced-input replay, typed predicates, RNG restore order, index locking, strict JSON serialization, and operational safety. |
+| 1 Capsules, capture, execution | Partial | Phase 0 | `mlcap-1` schema/protocol, migrations, selective loading, integrity limits, signing hooks, factory workers, and shared `ExecutionService` are covered; distributed recovery and provider-specific remote workflows remain. |
+| 2 Statistical and behavioral comparison | Partial | Phase 0–1 | Paired/independent comparisons, missing-data accounting, behavioral and performance evidence, and policy checks are covered; sequential inference, multiplicity correction, and distributed measurement remain. |
+| 3 Stochastic Git bisection | Partial | Phase 2 | Matched-seed, predicate-aware, cached, budgeted isolated-worktree bisection is implemented; adaptive allocation and non-monotonic-history optimization remain. |
+| 4 Deterministic incident replay | Partial | Phase 1 | Structured replay envelopes, factory workers, RNG/state restoration, checkpoint gaps, timeouts, and explicit outcomes are implemented; deeper distributed/container replay remains. |
+| 5 Hierarchical failure shrinking | Partial | Phase 4 | Bounded, resumable, signature-preserving row/column/token/sequence/tensor/structured reducers are implemented; exhaustive minimality proofs remain. |
+| 6 Bounded tensor and data tracing | Partial | Phase 4 | Ring buffers, tensor statistics/provenance, hooks, and divergence localization are implemented; distributed tracing and benchmark corpus remain. |
+| 7 Model and feature parity | Partial | Phase 5–6 | Callable, TorchScript, ONNX, eager-export, stateful, structured, optional TensorRT/OpenVINO, feature-table, hooks, and shrink integrations are implemented; deeper provider instrumentation remains. |
+| 8 Impact analysis and selective validation | Partial | Phase 2 | Python plus SQL/notebook/shell/pipeline readers, conservative lineage imports/exports, confidence/explanations, and validation planning are implemented; incremental graph caching remains. |
+| 9 ML-aware CI | Partial | Phase 2, 8 | Required-evidence policy and terminal/JSON/JUnit/SARIF/GitHub reports are implemented; resumable evidence reuse and signed policy artifacts remain. |
+| 10 Integrations, operations, and enterprise readiness | Partial | prior phases | Lazy plugins, capability negotiation, redaction/scanning, audit logs, legal holds, recoverable retention, offline queues, and remote facades are implemented; distributed coordination and production-provider hardening remain. |
 
 The first release milestone remains: a new user can reproduce a documented
 attention failure, identify its introducing commit, reduce its input, and
@@ -104,13 +111,24 @@ an unpaired sample can look like a pass.
 
 ## Phase 0: make the current implementation trustworthy
 
-**Status:** done for the correctness blockers that can produce false results
-in capture, replay, shrink, bisect, and CI. Remaining items in this section
-that describe broader product scope (full parity input contracts, CUDA RNG,
-distributed replay) stay with later phases.
+**Status:** done for the 0.1.1 correctness-recovery scope. The original
+in-tree correctness blockers (P0.1–P0.9 capture/replay/shrink/bisect/CI bugs)
+and the adversarial evidence cases below have regression tests.
 
 Complete this phase before adding broad features. These issues can currently produce false
 results or prevent the core workflow.
+
+### P0 evidence bugs covered by 0.1.1
+
+| ID | Problem | Acceptance |
+| --- | --- | --- |
+| P0-group | Group comparison ignored failures outside the first run | A failure anywhere in a group triggers the configured policy; reordering capsules does not change the decision |
+| P0-pairing | Missing identities paired by list position as `stable_identity`; duplicate seeds counted as independent repetitions | Missing identities cannot silently establish paired inference; duplicate capsules cannot increase effective sample size |
+| P0-replay-gaps | Sparse replay restored checkpoint 0, executed only the failing input from step 2, and reported verified reproduction | Checkpoint 0 → step 2 executes intervening steps; missing history produces incomplete replay before the target executes |
+| P0-restore | `strict_state=False` could omit model restoration while reporting `state_restoration_verified=True` | A matching exception with omitted model state may count as failure reproduction, but cannot count as verified state restoration |
+
+Broader product scope from the original P0.1–P0.9 list (full parity input
+contracts, CUDA RNG, distributed replay) stays with later phases.
 
 ### P0.1 Preserve failures and non-finite observations
 
@@ -230,8 +248,11 @@ change, and slice search does not create an uncorrected false CI failure.
 **Status:** partial. Directory/zip saves are staged and published only when
 complete; `include_artifacts=False` hashes payloads without retaining them;
 `mlforensics.toml` rejects unknown keys; every CLI capsule argument honors
-`[storage].root` and the local run index. Unified capture-session routing,
-streaming child output, and JSON Schema publication remain open.
+`[storage].root` and the local run index. The `mlcap-1` JSON Schema and protocol
+document are packaged, and capsule loading supports integrity-checked streaming,
+limits, selective retention, migrations, signatures, and provenance. Unified
+capture-session routing, distributed recovery, and provider-specific remote
+transfers remain open.
 
 ### Capsule format
 
@@ -279,10 +300,10 @@ streaming child output, and JSON Schema publication remain open.
 
 ## Phase 2: statistical and behavioral comparison
 
-**Status:** comparison, missing-evidence CI, and behavioral accounting already
-have Phase 0 regression coverage. The PyTorch debugging demo that this delivery
-order placed in Phase 2 lives in `tests/diagnose/test_pytorch_workflow.py`;
-the packaged attention-git fixture is still open.
+**Status:** paired comparison, missing-evidence CI, behavioral accounting,
+performance evidence, and the packaged attention-git fixture have regression
+coverage. Sequential confidence methods, multiple-comparison correction,
+distributed measurement, and the full performance benchmark corpus remain open.
 
 ### Experimental design
 

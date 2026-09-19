@@ -54,6 +54,25 @@ def test_pytorch_capture_replay_shrink_and_trace_nonfinite_attention():
 
     reduced = shrink(failing, still_fails, kind="auto")
     assert still_fails(reduced.value)
+    assert reduced.metadata["final_nested_size"] < reduced.metadata["original_nested_size"]
+    assert tuple(reduced.value["tokens"].shape) != tuple(failing["tokens"].shape) or tuple(
+        reduced.value["mask"].shape
+    ) != tuple(failing["mask"].shape)
+
+    from mlforensics.diagnose.shrink import shrink_capsule
+
+    result, child = shrink_capsule(
+        capsule,
+        still_fails,
+        output=None,
+        state_restorers={
+            "model": model.load_state_dict,
+            "optimizer": optimizer.load_state_dict,
+        },
+        runner=run_step,
+    )
+    assert result.metadata.get("child_replay_verified") is True
+    assert still_fails(result.value)
 
     tracer = TensorTracer()
     handles = attach_torch_hooks(model, tracer)

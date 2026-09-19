@@ -121,7 +121,15 @@ def load_relationships(
                             ),
                             f"file:{value}",
                         )
-                    graph.add_edge(consumer, target, "implemented_by")
+                    graph.add_edge(
+                        consumer,
+                        target,
+                        "implemented_by",
+                        {
+                            "confidence": "high",
+                            "explanation": "configured implementation path",
+                        },
+                    )
             fields = (
                 "inputs",
                 "depends_on",
@@ -147,14 +155,25 @@ def load_relationships(
                         consumer,
                         ensure(dependency, dependency_kind),
                         "configured",
-                        {"field": field},
+                        {
+                            "field": field,
+                            "confidence": "high",
+                            "explanation": f"configured {field} relationship",
+                        },
                     )
             for produced in _names(metadata.get("produces")):
                 # A producer declaration on a dataset/feature means the named
                 # artifact depends on this entry.
                 produced_kind = "feature" if kind == "dataset" else "model"
                 graph.add_edge(
-                    ensure(produced, produced_kind), consumer, "configured", {"field": "produces"}
+                    ensure(produced, produced_kind),
+                    consumer,
+                    "configured",
+                    {
+                        "field": "produces",
+                        "confidence": "high",
+                        "explanation": "configured producer relationship",
+                    },
                 )
 
     for relationship in (
@@ -165,13 +184,28 @@ def load_relationships(
         source, target = relationship.get("source"), relationship.get("target")
         if source is None or target is None:
             continue
-        source_id = str(source) if ":" in str(source) else str(source)
-        target_id = str(target) if ":" in str(target) else str(target)
+
+        def resolve_reference(value: Any) -> str:
+            text = str(value)
+            if text in graph.nodes:
+                return text
+            for kind in ("dataset", "feature", "model"):
+                candidate = f"{kind}:{text}"
+                if candidate in graph.nodes:
+                    return candidate
+            return text
+
+        source_id = resolve_reference(source)
+        target_id = resolve_reference(target)
         graph.add_edge(
             source_id,
             target_id,
             str(relationship.get("kind", "configured")),
-            {k: v for k, v in relationship.items() if k not in {"source", "target", "kind"}},
+            {
+                **{k: v for k, v in relationship.items() if k not in {"source", "target", "kind"}},
+                "confidence": relationship.get("confidence", "medium"),
+                "explanation": relationship.get("explanation", "configured relationship"),
+            },
         )
     return graph
 

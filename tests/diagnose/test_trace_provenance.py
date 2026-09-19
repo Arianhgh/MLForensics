@@ -93,3 +93,36 @@ def test_tensor_tracer_records_the_training_step() -> None:
     assert recorded is not None
     assert recorded.step == 7
     assert [item.step for item in tracer.events()] == [7]
+
+
+def test_trace_explains_evicted_parents_and_returns_a_bounded_window() -> None:
+    tracer = TensorTracer(max_events=2)
+    source = Array([1.0])
+    middle = Array([2.0])
+    bad = Array([math.nan])
+    first = tracer.record("source", source)
+    assert first is not None
+    tracer.record("middle", middle, inputs=source)
+    abnormal = tracer.record("bad", bad, inputs=middle)
+    assert abnormal is not None
+
+    analysis = tracer.analyze()
+    assert analysis["causal_window"]
+    explanation = analysis["missing_parent_explanations"][0]
+    assert explanation["parent_id"] == first.tensor_id
+    assert explanation["reason"] == "evicted_from_ring_buffer"
+    assert "bounded trace buffer" in explanation["explanation"]
+
+
+def test_trace_incident_preserves_first_abnormal_anchor_after_serialization() -> None:
+    trace = TraceBuffer(1)
+    trace.record_tensor("bad", [math.nan], tensor_id="bad")
+    trace.record_tensor("later", [1.0], tensor_id="later")
+    capsule = RunCapsule(
+        Run(run_id="trace-anchor", status="failed", started_at="t"),
+        evidence={"tensor_trace": trace.to_dict()},
+    )
+
+    analysis = trace_incident(capsule, radius=0)
+    assert analysis["first_abnormal"]["kind"] == "bad"
+    assert [item["kind"] for item in analysis["causal_window"]] == ["bad"]

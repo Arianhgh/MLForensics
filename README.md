@@ -87,7 +87,9 @@ mlforensics ci \
 
 `compare` reports evidence and always exits successfully when the comparison can
 be computed. `ci` exits with status 1 when a configured regression or a built-in
-data-quality/run-health check fails.
+data-quality/run-health check fails. With `--json`, `run` emits one JSON report
+on stdout; child output is retained in that report instead of being mixed into
+the machine-readable stream.
 
 ### One run per side is not a result
 
@@ -156,6 +158,13 @@ run.mlcap/
 │   └── state.json
 └── artifacts/<sha256>
 ```
+
+The protocol definition and JSON Schema ship with the package. Applications can
+inspect them through `RunCapsule.protocol_document()` and
+`RunCapsule.protocol_schema()`. `RunCapsule.load()` verifies every member while
+optionally retaining only selected files or omitting artifact payloads; callers
+can also enforce per-file/total-size limits, migrations, and detached signature
+verification.
 
 The immutable core capture API can attach replay inputs, named state providers,
 models, lineage, and embedded artifacts directly:
@@ -348,8 +357,11 @@ Supported backend specifications are:
 General pickle-based PyTorch loading is intentionally unsupported. When
 `--inputs` is omitted, deterministic representative scalar or shaped inputs are
 generated from `--shape`, `--count`, and `--seed`; `--edge-inputs` adds boundary
-and adversarial cases. Parity exits with status 1 on any mismatch or backend
-error.
+and adversarial cases. Parity exits with status 1 on a candidate mismatch or
+backend error, and status 2 when the reference cannot execute or no cases are
+available. A JSON input may be a list of cases, a single named-input mapping,
+or an object with a `cases`/`inputs` list. Multi-input model calls use mappings
+keyed by the model's input names.
 
 ### CI gate
 
@@ -365,12 +377,15 @@ mlforensics ci \
 The gate fails on statistical/resource regressions, failed candidate runs,
 non-finite observations, missing candidate evidence, behavioral regressions, or
 captured parity failures. Optional evidence is checked only when present. Use
-`--json` for CI annotations or downstream tooling.
+`--json` for CI annotations or downstream tooling. CI also supports
+`--format text|json|junit|sarif|github` for native test-reporting integrations;
+`--format json` is equivalent to `--json`.
 
 ## Configuration
 
 The CLI loads `mlforensics.toml` in the current directory, or a file passed as a
-global option before the subcommand:
+global option before the subcommand. For consistency, `--config PATH` is also
+accepted after any subcommand's options:
 
 ```console
 mlforensics --config config/mlforensics.toml run python train.py
@@ -441,6 +456,15 @@ Weights & Biases artifacts, reading and exporting DVC-shaped dependency data,
 and emitting OpenLineage-shaped events. These stores and bridges are explicit
 Python API calls; the CLI does not upload capsules automatically.
 
+Operational helpers are available without cloud dependencies. Use
+`scan_sensitive_data()` before sharing a capsule, `garbage_collect()` for
+policy-based retention (dry-run by default, with recoverable trash and legal
+hold support), `AuditLogger` for append-only redacted JSONL events, and
+`RemoteOperations`/`OfflineQueue` when a remote transport or an offline upload
+queue is explicitly supplied. Plugins are discovered lazily through the
+`mlforensics.plugins` entry-point group and negotiate protocol versions and
+capabilities before provider code is imported.
+
 ## Privacy and security
 
 Capsules are evidence bundles and may contain sensitive material. Review them
@@ -482,6 +506,12 @@ Useful entry points include:
 - `TensorTracer` and `TraceBuffer` for bounded tensor provenance;
 - `impact_from_git()` and `ImpactPlanner` for validation planning;
 - `compare_models()` and `load_backend()` for parity testing;
+- `compare_features()` and `FeatureParityComparator` for Python/Pandas/SQL
+  feature parity;
+- `RunCapsule.protocol_schema()` and `RunCapsule.protocol_document()` for
+  interchange metadata;
+- `scan_sensitive_data()`, `garbage_collect()`, `AuditLogger`, and
+  `discover_plugins()` for safe operational workflows;
 - `FsspecArtifactStore` for optional URI-backed artifact persistence;
 - `MLflowAdapter`, `WandBAdapter`, `OpenLineageAdapter`, and DVC helpers from
   `mlforensics.integrations`.

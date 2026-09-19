@@ -9,11 +9,13 @@ from .bisect import (
     RunOutcome,
     StochasticBisector,
     SubprocessGit,
+    WorktreeGit,
     bisect,
     bisect_commits,
     decide_regression,
     git_bisect,
 )
+from .factory import load_replay_factory, replay_in_worker, replay_with_factory
 from .replay import (
     Incident,
     ReplayEngine,
@@ -47,6 +49,7 @@ from .trace import (
     TraceEvent,
     attach_torch_hooks,
     detect_non_finite,
+    persist_trace,
     tensor_event,
     trace_incident,
 )
@@ -70,6 +73,7 @@ __all__ = [
     "ShrinkReport",
     "StochasticBisector",
     "SubprocessGit",
+    "WorktreeGit",
     "SeedRun",
     "TensorTracer",
     "RingBufferTrace",
@@ -83,8 +87,12 @@ __all__ = [
     "decide_regression",
     "ddmin",
     "git_bisect",
+    "load_replay_factory",
+    "persist_trace",
     "replay",
+    "replay_in_worker",
     "replay_incident",
+    "replay_with_factory",
     "restore_rng_state",
     "snapshot_state",
     "shrink",

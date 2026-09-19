@@ -11,12 +11,15 @@ from .models import RECORD_TYPES, SCHEMA_VERSION
 
 
 def _contract_types() -> dict[str, Any]:
-    from .contracts import ExecutionResult, PredicateResult, RunGroup
+    from .contracts import ExecutionResult, ExecutionSpec, PredicateResult, RunGroup
+    from .execution import ExecutionRecord
 
     return {
         "execution_result": ExecutionResult,
+        "execution_spec": ExecutionSpec,
         "predicate_result": PredicateResult,
         "run_group": RunGroup,
+        "execution_record": ExecutionRecord,
     }
 
 
@@ -27,12 +30,35 @@ def _plain(value: Any) -> Any:
     if hasattr(value, "to_dict"):
         return _plain(value.to_dict())
     if isinstance(value, dict):
-        return {str(key): _plain(item) for key, item in value.items()}
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            # JSON object keys are strings.  Silently coercing two distinct
+            # Python keys to the same string would make the serialized record
+            # depend on insertion order and lose evidence.
+            if not isinstance(key, str):
+                raise TypeError("canonical JSON mappings must use string keys")
+            if key in result:
+                raise TypeError(f"duplicate canonical JSON key {key!r}")
+            result[key] = _plain(item)
+        return result
     if isinstance(value, (tuple, list)):
         return [_plain(item) for item in value]
     if isinstance(value, Path):
         return str(value)
     return value
+
+
+def _reject_constant(value: str) -> Any:
+    raise ValidationError(f"non-finite JSON constant {value!r} is not allowed")
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValidationError(f"duplicate JSON object key {key!r}")
+        result[key] = value
+    return result
 
 
 def dumps(value: Any) -> str:
@@ -49,7 +75,11 @@ def dump_bytes(value: Any) -> bytes:
 def loads(data: str | bytes | bytearray, type_: type[T] | None = None) -> T | Any:
     """Decode JSON, optionally reconstructing a known record class."""
     try:
-        raw = json.loads(data)
+        raw = json.loads(
+            data,
+            parse_constant=_reject_constant,
+            object_pairs_hook=_reject_duplicate_keys,
+        )
     except (TypeError, ValueError) as exc:
         raise ValidationError("invalid JSON") from exc
     if not isinstance(raw, dict):

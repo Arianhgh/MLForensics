@@ -1,5 +1,5 @@
 from mlforensics.analysis import compare_runs, render_comparison
-from mlforensics.core import MetricSeries, ResourceSeries, Run
+from mlforensics.core import MetricSeries, Observation, ResourceSeries, Run
 
 
 def _run(run_id, accuracy, latency, seed=None):
@@ -122,3 +122,110 @@ def test_noninferiority_margin_is_a_real_gate():
     )
     assert "noninferiority:accuracy" in result.regressions
     assert result.evidence["accuracy"]["noninferior"] is False
+
+
+def test_duplicate_seed_without_trial_is_inconclusive():
+    baseline = [_run(f"old-{index}", [0.8], [10], seed=7) for index in range(5)]
+    candidate = [_run(f"new-{index}", [0.7], [10], seed=7) for index in range(5)]
+    result = compare_runs(baseline, candidate, n_resamples=50)
+    quality = result.evidence["_data_quality"]["metrics"]["accuracy"]
+    assert quality["pairing"] == "ambiguous"
+    assert result.status == "inconclusive"
+
+
+def test_missing_identities_cannot_pair_a_group():
+    baseline = [_run(f"old-{index}", [0.8 + index / 100], [10]) for index in range(5)]
+    candidate = [_run(f"new-{index}", [0.7 + index / 100], [10]) for index in range(5)]
+    result = compare_runs(baseline, candidate, n_resamples=50)
+    quality = result.evidence["_data_quality"]["metrics"]["accuracy"]
+    assert quality["pairing"] == "unpaired"
+    assert result.status == "inconclusive"
+
+
+def test_duplicate_capsules_do_not_inflate_sample_size():
+    run = _run("shared", [0.8], [10], seed=3)
+    result = compare_runs([run, run, run], [run, run, run], n_resamples=50)
+    assert result.evidence["accuracy"]["replicates"] == 1
+
+
+def test_duplicate_observation_identities_are_inconclusive():
+    baseline = Run(
+        run_id="old",
+        status="succeeded",
+        metrics=(MetricSeries("accuracy", [0.8, 0.8], identities=[7, 7]),),
+    )
+    candidate = Run(
+        run_id="new",
+        status="succeeded",
+        metrics=(MetricSeries("accuracy", [0.7, 0.7], identities=[7, 7]),),
+    )
+    result = compare_runs(baseline, candidate, n_resamples=50)
+    quality = result.evidence["_data_quality"]["metrics"]["accuracy"]
+    assert quality["pairing"] == "ambiguous"
+    assert quality["paired_finite_observations"] == 0
+    assert quality["candidate_missing"] is False
+    assert result.status == "inconclusive"
+
+
+def test_run_identity_supports_sample_and_dataset_discriminators():
+    def make(run_id, sample_id, value):
+        return Run(
+            run_id=run_id,
+            status="succeeded",
+            metrics=(MetricSeries("accuracy", [value]),),
+            metadata={"seed": 3, "sample_id": sample_id, "dataset_version": "v1"},
+        )
+
+    result = compare_runs(
+        [make("old-a", "a", 0.8), make("old-b", "b", 0.8)],
+        [make("new-b", "b", 0.7), make("new-a", "a", 0.7)],
+        n_resamples=50,
+    )
+    assert result.evidence["accuracy"]["replicates"] == 2
+    assert result.evidence["_data_quality"]["metrics"]["accuracy"]["pairing"] == "stable_identity"
+
+
+def test_failed_observation_without_a_metric_series_is_retained_as_evidence():
+    baseline = Run(
+        run_id="old",
+        status="succeeded",
+        observations=(Observation.from_value("accuracy", 0.8, identity="trial"),),
+    )
+    candidate = Run(
+        run_id="new",
+        status="failed",
+        observations=(Observation.from_value("accuracy", float("nan"), identity="trial"),),
+    )
+    result = compare_runs(baseline, candidate, n_resamples=20)
+    assert "accuracy" in result.evidence["_data_quality"]["metrics"]
+    assert result.evidence["_data_quality"]["metrics"]["accuracy"]["candidate_nonfinite"] == 1
+    assert "nonfinite:accuracy" in result.regressions
+
+
+def test_failed_resource_observation_without_a_resource_series_is_retained():
+    baseline = Run(
+        run_id="old",
+        status="succeeded",
+        resources=(ResourceSeries("peak_rss", [100.0]),),
+    )
+    candidate = Run(
+        run_id="new",
+        status="succeeded",
+        observations=(
+            Observation.from_value(
+                "peak_rss", float("inf"), identity="trial", metadata={"kind": "resource"}
+            ),
+        ),
+    )
+    result = compare_runs(baseline, candidate, n_resamples=20)
+    assert result.evidence["_data_quality"]["resources"]["peak_rss"]["candidate_nonfinite"] == 1
+    assert "nonfinite:resource:peak_rss" in result.regressions
+
+
+def test_minimum_sample_count_withholds_regression_verdict():
+    baseline = _repeated("old", [0.8, 0.8, 0.8, 0.8, 0.8], [10, 10, 10])[:2]
+    candidate = _repeated("new", [0.6, 0.6, 0.6, 0.6, 0.6], [10, 10, 10])[:2]
+    result = compare_runs(baseline, candidate, min_sample_count=3, n_resamples=50)
+    assert result.status == "inconclusive"
+    assert "accuracy" not in result.regressions
+    assert result.evidence["accuracy"]["insufficient_evidence"] is True

@@ -7,7 +7,8 @@ import json
 import math
 import random
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from ..core import FailureSignature, RNGState, RunCapsule, decode_state_tree, digest_state_tree
@@ -103,22 +104,85 @@ def restore_rng_state(state: RNGState | Mapping[str, Any]) -> list[str]:
             restored.append("NumPy RNG")
         except Exception:
             pass
+    restored_torch, _failures = _restore_rng_state_detailed(states)
+    restored.extend(item for item in restored_torch if item not in restored)
+    return restored
+
+
+def _torch_state_tensor(torch: Any, value: Any) -> Any:
+    """Turn a portable torch RNG value into the runtime's uint8 tensor."""
+    value = _decode_state(value)
+    if hasattr(value, "dtype") and hasattr(value, "tolist"):
+        return value
+    constructor = getattr(torch, "as_tensor", None) or getattr(torch, "tensor", None)
+    if not callable(constructor):
+        return value
+    uint8 = getattr(torch, "uint8", None)
+    return constructor(value, dtype=uint8) if uint8 is not None else constructor(value)
+
+
+def _restore_rng_state_detailed(states: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+    """Restore each RNG independently and retain failures for replay reports."""
+    restored: list[str] = []
+    failures: list[str] = []
+    if "python" in states:
+        try:
+            random.setstate(_tupleize(_decode_state(states["python"])))
+            restored.append("Python RNG")
+        except Exception as exc:
+            failures.append(f"Python RNG: {type(exc).__name__}: {exc}")
+    if "numpy" in states:
+        try:
+            import numpy as np  # type: ignore
+
+            value = _decode_state(states["numpy"])
+            if isinstance(value, list) and len(value) >= 5:
+                value = (
+                    value[0],
+                    np.asarray(value[1], dtype="uint32"),
+                    int(value[2]),
+                    int(value[3]),
+                    float(value[4]),
+                )
+            np.random.set_state(value)
+            restored.append("NumPy RNG")
+        except Exception as exc:
+            failures.append(f"NumPy RNG: {type(exc).__name__}: {exc}")
+    if "torch_cpu" not in states and "torch_cuda" not in states:
+        return restored, failures
+    try:
+        import torch  # type: ignore
+    except ImportError:
+        failures.extend(
+            label
+            for key, label in (("torch_cpu", "Torch CPU RNG"), ("torch_cuda", "Torch CUDA RNG"))
+            if key in states
+        )
+        return restored, failures
+
     if "torch_cpu" in states:
         try:
-            import torch  # type: ignore
-
-            cpu_state = _decode_state(states["torch_cpu"])
-            torch.set_rng_state(torch.tensor(cpu_state, dtype=torch.uint8))
+            torch.set_rng_state(_torch_state_tensor(torch, states["torch_cpu"]))
             restored.append("Torch CPU RNG")
-            if "torch_cuda" in states and torch.cuda.is_available():
-                cuda_states = _decode_state(states["torch_cuda"])
-                torch.cuda.set_rng_state_all(
-                    [torch.tensor(item, dtype=torch.uint8) for item in cuda_states]
-                )
-                restored.append("Torch CUDA RNG")
-        except Exception:
-            pass
-    return restored
+        except Exception as exc:
+            failures.append(f"Torch CPU RNG: {type(exc).__name__}: {exc}")
+    if "torch_cuda" in states:
+        try:
+            cuda = getattr(torch, "cuda", None)
+            if (
+                cuda is None
+                or not callable(getattr(cuda, "is_available", None))
+                or not cuda.is_available()
+            ):
+                raise RuntimeError("CUDA is unavailable")
+            raw_states = _decode_state(states["torch_cuda"])
+            if not isinstance(raw_states, Sequence) or isinstance(raw_states, (str, bytes)):
+                raise TypeError("CUDA RNG state must be a sequence of device states")
+            cuda.set_rng_state_all([_torch_state_tensor(torch, item) for item in raw_states])
+            restored.append("Torch CUDA RNG")
+        except Exception as exc:
+            failures.append(f"Torch CUDA RNG: {type(exc).__name__}: {exc}")
+    return restored, failures
 
 
 class TorchStateAdapter:
@@ -139,9 +203,15 @@ class TorchStateAdapter:
         return result
 
     def restore(self, state: Mapping[str, Any]) -> None:
-        self.torch.set_rng_state(state["torch_cpu"])
-        if "torch_cuda" in state and self.torch.cuda.is_available():
-            self.torch.cuda.set_rng_state_all(state["torch_cuda"])
+        if "torch_cpu" in state:
+            self.torch.set_rng_state(_torch_state_tensor(self.torch, state["torch_cpu"]))
+        cuda_state = state.get("torch_cuda")
+        cuda = getattr(self.torch, "cuda", None)
+        if cuda_state is not None and cuda is not None and cuda.is_available():
+            raw_states = _decode_state(cuda_state)
+            if isinstance(raw_states, Sequence) and not isinstance(raw_states, (str, bytes)):
+                raw_states = [_torch_state_tensor(self.torch, item) for item in raw_states]
+            cuda.set_rng_state_all(raw_states)
 
     def seed(self, seed: int) -> None:
         self.torch.manual_seed(seed)
@@ -178,9 +248,45 @@ class _ReplayEvidence:
     executed_step: int | float | None = None
     limitations: tuple[str, ...] = ()
     restore_order: tuple[str, ...] = ()
+    execution_steps: tuple[tuple[int | float, Any], ...] = ()
+    required_state: tuple[str, ...] = ()
+    supported_state: Mapping[str, Any] = field(default_factory=dict)
+    determinism: str | None = None
+    runtime_metadata: Mapping[str, Any] = field(default_factory=dict)
+    checkpoint_context: Mapping[str, Any] = field(default_factory=dict)
 
 
 _RNG_KEYS = frozenset({"python", "numpy", "torch_cpu", "torch_cuda"})
+
+
+def _decode_named_state(
+    capsule: RunCapsule,
+    values: Any,
+    *,
+    limitations: list[str],
+    label: str,
+) -> dict[str, Any]:
+    """Decode named state without turning one incompatible component into bad evidence."""
+    decoded: dict[str, Any] = {}
+    if isinstance(values, Mapping):
+        items = values.items()
+    elif isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+        items = (
+            (item.get("name", f"state-{index}"), item)
+            for index, item in enumerate(values)
+            if isinstance(item, Mapping)
+        )
+    else:
+        return decoded
+    for name, value in items:
+        name = str(name)
+        try:
+            decoded[name] = _snapshot_value(capsule, value)
+        except Exception as exc:
+            limitations.append(
+                f"state {name!r} from {label} is incompatible: {type(exc).__name__}: {exc}"
+            )
+    return decoded
 
 
 def _finite_step(value: Any) -> int | float | None:
@@ -201,6 +307,52 @@ def _steps_equal(left: Any, right: Any) -> bool:
     return float(left) == float(right)
 
 
+def _checkpoint_is_before_step(item: Mapping[str, Any]) -> bool:
+    if item.get("before_step") is False:
+        return False
+    metadata = item.get("metadata")
+    if isinstance(metadata, Mapping) and metadata.get("before_step") is False:
+        return False
+    return True
+
+
+def _integerish(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and float(value) == int(value)
+    )
+
+
+def _required_execution_steps(start: int | float, target: int | float) -> list[int | float]:
+    if _integerish(start) and _integerish(target):
+        begin, end = int(start), int(target)
+        if end < begin:
+            return [target]
+        return list(range(begin, end + 1))
+    return [start, target] if float(start) != float(target) else [target]
+
+
+def _decode_step_input(capsule: RunCapsule, encoded: Any, *, plan_input: Any) -> Any:
+    if encoded is plan_input:
+        return _snapshot_value(capsule, encoded)
+    return _artifact_value(capsule, encoded)
+
+
+def _application_state_names(state: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(str(name) for name in state if name not in _RNG_KEYS)
+
+
+def _state_restoration_verified(
+    required: Sequence[str],
+    restored: Sequence[str],
+    omitted: Sequence[str],
+    failed: Sequence[str],
+) -> bool:
+    restored_set = set(restored)
+    return not omitted and not failed and all(name in restored_set for name in required)
+
+
 def _report_metadata(
     evidence: _ReplayEvidence, *, input_digest: str | None = None, **extra: Any
 ) -> dict[str, Any]:
@@ -211,9 +363,16 @@ def _report_metadata(
         "requested_step": evidence.requested_step,
         "executed_step": evidence.executed_step,
         "limitations": list(evidence.limitations),
+        "determinism": evidence.determinism,
+        "supported_state": dict(evidence.supported_state),
+        "checkpoint_context": dict(evidence.checkpoint_context),
         "executed_input_digest": input_digest,
+        "planned_steps": [step for step, _value in evidence.execution_steps],
     }
     payload.update(extra)
+    executed_steps = payload.get("executed_steps")
+    if isinstance(executed_steps, Sequence) and executed_steps:
+        payload["executed_step"] = executed_steps[-1]
     return payload
 
 
@@ -290,8 +449,13 @@ def _capsule_evidence(
             for index, snapshot in enumerate(getattr(plan, "state", ()))
         }
     named = named if isinstance(named, Mapping) else {}
+    limitations = list(getattr(plan, "limitations", ())) if plan is not None else []
+    raw_limitations = replay.get("limitations", ())
+    if isinstance(raw_limitations, Sequence) and not isinstance(raw_limitations, (str, bytes)):
+        limitations.extend(str(item) for item in raw_limitations)
     state: dict[str, Any] = dict(_rng_mapping(capsule.run.rng_state))
-    state.update({str(name): _snapshot_value(capsule, value) for name, value in named.items()})
+    captured_state_names = [str(name) for name in named]
+    state.update(_decode_named_state(capsule, named, limitations=limitations, label="replay state"))
     raw_checkpoints: list[Any] = []
     candidate_checkpoints = replay.get("checkpoints", ())
     if isinstance(candidate_checkpoints, Sequence) and not isinstance(
@@ -308,7 +472,6 @@ def _capsule_evidence(
             item = item.to_dict()
         if isinstance(item, Mapping):
             normalized_checkpoints.append(item)
-    limitations = list(getattr(plan, "limitations", ())) if plan is not None else []
     inputs_by_step: dict[float, Any] = {}
     for item in normalized_checkpoints:
         step = item.get("step")
@@ -328,6 +491,23 @@ def _capsule_evidence(
         if previous is not None and previous != batch:
             raise ValueError(f"ambiguous replay input for step {step}")
         inputs_by_step[key] = batch
+    history = replay.get("input_history", ())
+    if isinstance(history, Sequence) and not isinstance(history, (str, bytes)):
+        for item in history:
+            if not isinstance(item, Mapping):
+                continue
+            step = item.get("step")
+            batch = item.get("batch", item.get("input"))
+            if (
+                batch is None
+                or isinstance(step, bool)
+                or not isinstance(step, (int, float))
+                or not math.isfinite(float(step))
+            ):
+                continue
+            key = float(step)
+            if key not in inputs_by_step:
+                inputs_by_step[key] = batch
     override_encoded = replay.get("execution_input") if "execution_input" in replay else None
     override_step = _finite_step(replay.get("execution_input_step"))
     if override_encoded is not None and override_step is None:
@@ -360,20 +540,23 @@ def _capsule_evidence(
         if selected_checkpoint is not None:
             checkpoint_state = selected_checkpoint.get("state", {})
             if isinstance(checkpoint_state, Mapping):
-                state.update(
-                    {
-                        str(name): _snapshot_value(capsule, value)
-                        for name, value in checkpoint_state.items()
-                    }
-                )
+                captured_state_names.extend(str(name) for name in checkpoint_state)
             elif isinstance(checkpoint_state, Sequence) and not isinstance(
                 checkpoint_state, (str, bytes)
             ):
-                for index, snapshot in enumerate(checkpoint_state):
-                    if not isinstance(snapshot, Mapping):
-                        continue
-                    name = str(snapshot.get("name", f"state-{index}"))
-                    state[name] = _snapshot_value(capsule, snapshot)
+                captured_state_names.extend(
+                    str(item.get("name", f"state-{index}"))
+                    for index, item in enumerate(checkpoint_state)
+                    if isinstance(item, Mapping)
+                )
+            state.update(
+                _decode_named_state(
+                    capsule,
+                    checkpoint_state,
+                    limitations=limitations,
+                    label=f"checkpoint {selected_checkpoint.get('step')}",
+                )
+            )
             checkpoint_rng = selected_checkpoint.get("rng_state")
             if checkpoint_rng is not None:
                 if isinstance(checkpoint_rng, RNGState):
@@ -390,6 +573,20 @@ def _capsule_evidence(
     checkpoint_step = (
         selected_checkpoint.get("step") if isinstance(selected_checkpoint, Mapping) else None
     )
+    checkpoint_context = {}
+    if isinstance(selected_checkpoint, Mapping):
+        for key in ("epoch", "sampler_position", "sample_ids"):
+            if selected_checkpoint.get(key) is not None:
+                checkpoint_context[key] = selected_checkpoint[key]
+        selected_metadata = selected_checkpoint.get("metadata", {})
+        if isinstance(selected_metadata, Mapping):
+            checkpoint_context.update(
+                {
+                    str(key): value
+                    for key, value in selected_metadata.items()
+                    if key in {"epoch", "sampler_position", "sample_ids"} and value is not None
+                }
+            )
     execute_step = requested
     if execute_step is None:
         execute_step = override_step if override_encoded is not None else incident_step
@@ -454,6 +651,55 @@ def _capsule_evidence(
         raw_limitations = selected_checkpoint.get("limitations")
         if isinstance(raw_limitations, Sequence) and not isinstance(raw_limitations, (str, bytes)):
             limitations.extend(str(item) for item in raw_limitations)
+    execution_steps: tuple[tuple[int | float, Any], ...] = ()
+    if execute_step is not None:
+        step_encoded: dict[float, Any] = dict(inputs_by_step)
+        if has_input:
+            step_encoded[float(execute_step)] = encoded_input
+        if checkpoint_step is not None:
+            before_step = (
+                _checkpoint_is_before_step(selected_checkpoint)
+                if isinstance(selected_checkpoint, Mapping)
+                else True
+            )
+            start = (
+                checkpoint_step
+                if before_step
+                else (int(checkpoint_step) + 1 if _integerish(checkpoint_step) else checkpoint_step)
+            )
+            needed = _required_execution_steps(start, execute_step)
+        else:
+            needed = [execute_step]
+        missing = [step for step in needed if float(step) not in step_encoded]
+        if missing:
+            raise IncompleteReplay(
+                execute_step,
+                restored_step=checkpoint_step,
+                message=(
+                    f"replay from checkpoint {checkpoint_step} to step {execute_step} is missing "
+                    f"intervening input(s) at {missing}; refusing to skip ahead"
+                ),
+            )
+        decoded_steps = []
+        for step in needed:
+            encoded = step_encoded[float(step)]
+            decoded_steps.append(
+                (step, _decode_step_input(capsule, encoded, plan_input=plan_input))
+            )
+        execution_steps = tuple(decoded_steps)
+        if decoded_steps:
+            input_value = decoded_steps[-1][1]
+            has_input = True
+            executed_step = decoded_steps[-1][0]
+    required_state = tuple(
+        str(name)
+        for name in (
+            tuple(getattr(plan, "restore_order", ()))
+            if plan is not None and getattr(plan, "restore_order", ())
+            else tuple(dict.fromkeys(captured_state_names or (str(key) for key in state)))
+        )
+        if name not in _RNG_KEYS
+    )
     return _ReplayEvidence(
         input=input_value,
         has_input=has_input,
@@ -488,6 +734,22 @@ def _capsule_evidence(
             if plan is not None
             else tuple(str(name) for name in state if name not in _RNG_KEYS)
         ),
+        execution_steps=execution_steps,
+        required_state=required_state,
+        supported_state=(
+            replay.get("supported_state", {})
+            if isinstance(replay.get("supported_state", {}), Mapping)
+            else {}
+        ),
+        determinism=(
+            str(replay.get("determinism"))
+            if replay.get("determinism") is not None
+            else (getattr(plan, "determinism", None) if plan is not None else None)
+        ),
+        runtime_metadata=(
+            replay.get("metadata", {}) if isinstance(replay.get("metadata", {}), Mapping) else {}
+        ),
+        checkpoint_context=checkpoint_context,
     )
 
 
@@ -502,13 +764,25 @@ def _extract_evidence(
         replay = incident.metadata.get("replay", {})
         replay = replay if isinstance(replay, Mapping) else {}
         state = replay.get("state", {})
+        state = state if isinstance(state, Mapping) else {}
+        metadata = replay.get("metadata", {})
         return _ReplayEvidence(
             replay.get("input"),
             "input" in replay,
-            state if isinstance(state, Mapping) else {},
+            state,
             replay.get("seed"),
             expected or _failure(replay.get("failure")),
             "incident",
+            required_state=_application_state_names(state),
+            supported_state=(
+                replay.get("supported_state", {})
+                if isinstance(replay.get("supported_state", {}), Mapping)
+                else {}
+            ),
+            determinism=(
+                str(replay["determinism"]) if replay.get("determinism") is not None else None
+            ),
+            runtime_metadata=metadata if isinstance(metadata, Mapping) else {},
         )
     if isinstance(incident, ReplayIncident):
         state = incident.state if isinstance(incident.state, Mapping) else {}
@@ -519,15 +793,29 @@ def _extract_evidence(
             incident.seed,
             expected or incident.expected,
             "replay_incident",
+            required_state=_application_state_names(state),
+            runtime_metadata=incident.metadata,
         )
     state = incident.get("state", incident.get("randomness", {}))
+    state = state if isinstance(state, Mapping) else {}
+    metadata = incident.get("metadata", {})
     return _ReplayEvidence(
         incident.get("input"),
         "input" in incident,
-        state if isinstance(state, Mapping) else {},
+        state,
         incident.get("seed"),
         expected or _failure(incident.get("failure", incident.get("expected"))),
         "mapping",
+        required_state=_application_state_names(state),
+        supported_state=(
+            incident.get("supported_state", {})
+            if isinstance(incident.get("supported_state", {}), Mapping)
+            else {}
+        ),
+        determinism=(
+            str(incident["determinism"]) if incident.get("determinism") is not None else None
+        ),
+        runtime_metadata=metadata if isinstance(metadata, Mapping) else {},
     )
 
 
@@ -550,6 +838,8 @@ def _invoke_runner(
         if item.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
     ]
     variadic = any(item.kind is inspect.Parameter.VAR_POSITIONAL for item in parameters.values())
+    if seed is not None and "seed" in parameters and positional:
+        return target(argument, seed=seed)
     if seed is not None and (variadic or len(positional) >= 2):
         return target(argument, seed)
     if has_argument and (variadic or positional):
@@ -561,6 +851,255 @@ def _invoke_runner(
     return target(argument)
 
 
+def _restore_component(
+    restorer: Any, state: Any, *, name: str | None = None
+) -> tuple[bool, str | None]:
+    """Restore a component using the common hook shapes used by ML objects."""
+    callback = getattr(restorer, "restore", None)
+    if callable(callback):
+        callback(state)
+        return True, None
+    callback = getattr(restorer, "load_state_dict", None)
+    if callable(callback):
+        result = callback(state)
+        missing = getattr(result, "missing_keys", ()) if result is not None else ()
+        unexpected = getattr(result, "unexpected_keys", ()) if result is not None else ()
+        missing = tuple(missing or ())
+        unexpected = tuple(unexpected or ())
+        if missing or unexpected:
+            return False, (
+                "incompatible state "
+                f"(missing_keys={list(missing)}, unexpected_keys={list(unexpected)})"
+            )
+        return True, None
+    callback = getattr(restorer, "set_state", None)
+    if callable(callback):
+        callback(state)
+        return True, None
+    if name == "dataloader" and isinstance(state, Mapping):
+        restored_nested = False
+        sampler = getattr(restorer, "sampler", None)
+        sampler_state = state.get("sampler")
+        if sampler is not None and sampler_state is not None:
+            restored_ok, issue = _restore_component(sampler, sampler_state, name="sampler")
+            if not restored_ok:
+                return False, issue
+            restored_nested = True
+        generator = getattr(restorer, "generator", None)
+        generator_state = state.get("generator")
+        if generator is not None and generator_state is not None:
+            setter = getattr(generator, "set_state", None)
+            if not callable(setter):
+                return False, "dataloader generator has no set_state() hook"
+            setter(generator_state)
+            restored_nested = True
+        if restored_nested:
+            return True, None
+    if callable(restorer):
+        restorer(state)
+        return True, None
+    raise TypeError("component has no restore(), load_state_dict(), set_state(), or callable hook")
+
+
+def _restore_checkpoint_context(name: str, restorer: Any, context: Mapping[str, Any]) -> str | None:
+    """Restore sampler epoch/position when a provider exposes those hooks."""
+    if name not in {"sampler", "batch_sampler", "dataloader"} or not context:
+        return None
+    sampler = getattr(restorer, "sampler", None) if name == "dataloader" else restorer
+    if sampler is None:
+        return None
+    epoch = context.get("epoch")
+    if epoch is not None:
+        setter = getattr(sampler, "set_epoch", None)
+        if callable(setter):
+            setter(epoch)
+        elif not hasattr(sampler, "epoch"):
+            return "sampler does not expose set_epoch() or an epoch attribute"
+    position = context.get("sampler_position")
+    if position is not None:
+        setter = getattr(sampler, "set_position", None)
+        if callable(setter):
+            setter(position)
+        elif hasattr(sampler, "position"):
+            try:
+                sampler.position = position
+            except Exception as exc:
+                return f"sampler position could not be restored: {type(exc).__name__}: {exc}"
+        else:
+            return "sampler does not expose set_position() or a position attribute"
+    return None
+
+
+def _failure_from_result(result: Any) -> FailureSignature | None:
+    if isinstance(result, FailureSignature):
+        return result
+    candidate = getattr(result, "failure", None)
+    if candidate is not None:
+        try:
+            return _failure(candidate)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(result, Mapping):
+        for key in ("failure", "failure_signature", "signature"):
+            candidate = result.get(key)
+            if candidate is None:
+                continue
+            try:
+                return _failure(candidate)
+            except (TypeError, ValueError):
+                return None
+        status = str(result.get("status", "")).casefold()
+        if status in {"timeout", "timed_out", "hang", "out_of_memory", "oom"}:
+            kind = (
+                "out_of_memory"
+                if status == "oom"
+                else "timeout"
+                if status in {"timeout", "timed_out"}
+                else status
+            )
+            default_message = "out of memory" if kind == "out_of_memory" else "operation timed out"
+            return FailureSignature.structured(
+                kind,
+                message=str(result.get("message") or result.get("error") or default_message),
+                details=(
+                    result.get("details", {})
+                    if isinstance(result.get("details", {}), Mapping)
+                    else {}
+                ),
+            )
+    return None
+
+
+class _ReplayTimeout(TimeoutError):
+    pass
+
+
+def _invoke_with_timeout(
+    runner: Callable[..., Any],
+    argument: Any,
+    has_argument: bool,
+    seed: int | None,
+    timeout: float | None,
+) -> Any:
+    if timeout is None:
+        return _invoke_runner(runner, argument, has_argument, seed)
+    import threading
+
+    completed = threading.Event()
+    outcome: list[Any] = []
+    error: list[BaseException] = []
+
+    def invoke() -> None:
+        try:
+            outcome.append(_invoke_runner(runner, argument, has_argument, seed))
+        except BaseException as exc:
+            error.append(exc)
+        finally:
+            completed.set()
+
+    thread = threading.Thread(target=invoke, name="mlforensics-replay", daemon=True)
+    thread.start()
+    if not completed.wait(timeout):
+        raise _ReplayTimeout(f"replay timed out after {timeout:g}s")
+    if error:
+        raise error[0]
+    return outcome[0] if outcome else None
+
+
+@contextmanager
+def _replay_runtime_context(evidence: _ReplayEvidence, limitations: list[str]) -> Any:
+    """Apply captured deterministic settings without importing torch eagerly."""
+    metadata = dict(evidence.runtime_metadata)
+    supported = evidence.supported_state
+    autocast_value = metadata.get("autocast", supported.get("autocast"))
+    deterministic = metadata.get("deterministic_algorithms")
+    if deterministic is None:
+        deterministic = metadata.get("torch_deterministic")
+    cudnn_deterministic = metadata.get("cudnn_deterministic")
+    cudnn_benchmark = metadata.get("cudnn_benchmark")
+    needs_torch = (
+        bool(autocast_value)
+        or deterministic is not None
+        or cudnn_deterministic is not None
+        or cudnn_benchmark is not None
+    )
+    if not needs_torch:
+        yield
+        return
+    try:
+        import torch  # type: ignore
+    except ImportError:
+        limitations.append(
+            "captured torch runtime settings could not be applied: PyTorch is unavailable"
+        )
+        yield
+        return
+
+    old_deterministic = None
+    old_cudnn = getattr(torch, "backends", None)
+    old_cudnn_deterministic = None
+    old_cudnn_benchmark = None
+    autocast = None
+    try:
+        if deterministic is not None and callable(
+            getattr(torch, "are_deterministic_algorithms_enabled", None)
+        ):
+            old_deterministic = torch.are_deterministic_algorithms_enabled()
+            torch.use_deterministic_algorithms(bool(deterministic))
+        cudnn = getattr(old_cudnn, "cudnn", None)
+        if cudnn is not None:
+            if cudnn_deterministic is not None:
+                old_cudnn_deterministic = cudnn.deterministic
+                cudnn.deterministic = bool(cudnn_deterministic)
+            if cudnn_benchmark is not None:
+                old_cudnn_benchmark = cudnn.benchmark
+                cudnn.benchmark = bool(cudnn_benchmark)
+        autocast_enabled = (
+            bool(autocast_value)
+            if not isinstance(autocast_value, Mapping)
+            else bool(autocast_value.get("enabled", False))
+        )
+        if autocast_enabled:
+            config = autocast_value if isinstance(autocast_value, Mapping) else {}
+            cuda = getattr(torch, "cuda", None)
+            cuda_available = callable(getattr(cuda, "is_available", None)) and cuda.is_available()
+            device_type = str(config.get("device_type", "cuda" if cuda_available else "cpu"))
+            options: dict[str, Any] = {}
+            if config.get("dtype") is not None:
+                dtype = config["dtype"]
+                options["dtype"] = getattr(torch, str(dtype).split(".")[-1], dtype)
+            if config.get("cache_enabled") is not None:
+                options["cache_enabled"] = bool(config["cache_enabled"])
+            factory = getattr(torch, "autocast", None)
+            if not callable(factory):
+                raise RuntimeError("torch.autocast is unavailable")
+            autocast = factory(device_type, **options)
+            autocast.__enter__()
+    except Exception as exc:
+        limitations.append(
+            f"captured torch runtime settings could not be applied: {type(exc).__name__}: {exc}"
+        )
+    try:
+        yield
+    finally:
+        if "autocast" in locals() and autocast is not None:
+            try:
+                autocast.__exit__(None, None, None)
+            except Exception:
+                pass
+        cudnn = getattr(old_cudnn, "cudnn", None)
+        if cudnn is not None:
+            if old_cudnn_deterministic is not None:
+                cudnn.deterministic = old_cudnn_deterministic
+            if old_cudnn_benchmark is not None:
+                cudnn.benchmark = old_cudnn_benchmark
+        if old_deterministic is not None:
+            try:
+                torch.use_deterministic_algorithms(old_deterministic)
+            except Exception:
+                pass
+
+
 class ReplayEngine:
     """Restore recorded state and verify that the recorded failure recurs."""
 
@@ -570,10 +1109,19 @@ class ReplayEngine:
         state_restorers: Mapping[str, StateRestorer] | None = None,
         strict_state: bool = True,
         reseed: bool = False,
+        timeout: float | None = None,
     ) -> None:
         self.state_restorers = dict(state_restorers or {})
         self.strict_state = strict_state
         self.reseed = reseed
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or timeout <= 0
+        ):
+            raise ValueError("timeout must be a positive finite number or None")
+        self.timeout = timeout
 
     def replay(
         self,
@@ -583,7 +1131,20 @@ class ReplayEngine:
         expected: FailureSignature | None = None,
         predicate: Callable[[Any], bool] | None = None,
         step: int | float | None = None,
+        timeout: float | None = None,
     ) -> ReplayResult:
+        effective_timeout = self.timeout if timeout is None else timeout
+        if effective_timeout is not None and (
+            isinstance(effective_timeout, bool)
+            or not isinstance(effective_timeout, (int, float))
+            or not math.isfinite(float(effective_timeout))
+            or effective_timeout <= 0
+        ):
+            return ReplayResult(
+                False,
+                error="timeout must be a positive finite number or None",
+                metadata={"verified": False, "status": "unavailable"},
+            )
         try:
             evidence = _extract_evidence(incident, expected, step)
         except CheckpointUnavailable as exc:
@@ -593,6 +1154,8 @@ class ReplayEngine:
                 metadata={
                     "verified": False,
                     "status": "unavailable-checkpoint",
+                    "replay_status": "unavailable",
+                    "reason": "checkpoint unavailable",
                     "requested_step": exc.step,
                 },
             )
@@ -603,6 +1166,7 @@ class ReplayEngine:
                 metadata={
                     "verified": False,
                     "status": "incomplete-replay",
+                    "replay_status": "incomplete",
                     "requested_step": exc.step,
                     "checkpoint_step": exc.restored_step,
                     "executed_step": None,
@@ -610,7 +1174,11 @@ class ReplayEngine:
                 },
             )
         except Exception as exc:
-            return ReplayResult(False, error=f"invalid replay evidence: {exc}")
+            return ReplayResult(
+                False,
+                error=f"invalid replay evidence: {exc}",
+                metadata={"verified": False, "status": "unavailable"},
+            )
         if evidence.capture_errors:
             return ReplayResult(
                 False,
@@ -618,57 +1186,125 @@ class ReplayEngine:
                 metadata=_report_metadata(
                     evidence,
                     verified=False,
+                    status="incomplete",
+                    replay_status="incomplete",
                     state_capture_errors=dict(evidence.capture_errors),
                 ),
             )
         restored: list[str] = []
-        missing: list[str] = []
+        omitted: list[str] = []
+        failed: list[str] = []
+        limitations = list(evidence.limitations)
+        required_state = evidence.required_state or _application_state_names(evidence.state)
         ordered_names = list(evidence.restore_order)
         ordered_names.extend(name for name in evidence.state if name not in ordered_names)
+
+        def report_evidence() -> _ReplayEvidence:
+            return replace(evidence, limitations=tuple(dict.fromkeys(limitations)))
+
+        def restoration_fields(*, extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
+            payload = {
+                "required_state": list(required_state),
+                "restored_state": list(restored),
+                "omitted_state": list(omitted),
+                "failed_state": list(failed),
+                "state_restoration_verified": _state_restoration_verified(
+                    required_state, restored, omitted, failed
+                ),
+            }
+            if extra:
+                payload.update(extra)
+            return payload
+
         for name in ordered_names:
             if name not in evidence.state:
+                if name in required_state and name not in omitted:
+                    omitted.append(name)
+                    limitations.append(f"state {name!r} was required but omitted from evidence")
                 continue
             state = evidence.state[name]
             if name in _RNG_KEYS:
                 continue
             restorer = self.state_restorers.get(name)
             if restorer is None:
-                missing.append(name)
+                omitted.append(name)
+                limitations.append(
+                    f"state {name!r} was omitted: no compatible restorer was supplied"
+                )
                 continue
             try:
-                callback = getattr(restorer, "restore", restorer)
-                callback(state)
+                has_restore_hook = any(
+                    callable(getattr(restorer, hook, None))
+                    for hook in ("restore", "load_state_dict", "set_state")
+                ) or callable(restorer)
+                context_only = (
+                    name in {"sampler", "batch_sampler", "dataloader"}
+                    and bool(evidence.checkpoint_context)
+                    and not has_restore_hook
+                )
+                restored_ok, issue = (
+                    (True, None) if context_only else _restore_component(restorer, state, name=name)
+                )
+                if not restored_ok:
+                    failed.append(name)
+                    limitations.append(f"state {name!r} is incompatible: {issue}")
+                    return ReplayResult(
+                        False,
+                        restored=restored,
+                        error=f"failed to restore state {name!r}: {issue}",
+                        metadata=_report_metadata(
+                            report_evidence(),
+                            verified=False,
+                            status="incomplete",
+                            replay_status="incomplete",
+                            **restoration_fields(),
+                        ),
+                    )
                 restored.append(name)
+                context_issue = _restore_checkpoint_context(
+                    name, restorer, evidence.checkpoint_context
+                )
+                if context_issue:
+                    # Sampler epoch/position metadata is supplementary to the
+                    # component state.  A callback-only restorer can restore
+                    # its state dictionary but cannot expose an attribute or
+                    # setter for every piece of loader context; retain that
+                    # limitation without discarding the successful state
+                    # restore or preventing the replay from executing.
+                    limitations.append(f"state {name!r} is incompatible: {context_issue}")
             except Exception as exc:
+                failed.append(name)
+                limitations.append(f"state {name!r} is incompatible: {type(exc).__name__}: {exc}")
                 return ReplayResult(
                     False,
                     restored=restored,
                     error=f"failed to restore state {name!r}: {type(exc).__name__}: {exc}",
-                    metadata={
-                        "verified": False,
-                        "source": evidence.source,
-                        "checkpoint_id": evidence.checkpoint_id,
-                        "checkpoint_step": evidence.checkpoint_step,
-                        "limitations": list(evidence.limitations),
-                    },
+                    metadata=_report_metadata(
+                        report_evidence(),
+                        verified=False,
+                        status="incomplete",
+                        replay_status="incomplete",
+                        **restoration_fields(),
+                    ),
                 )
-        if missing and self.strict_state:
+        if omitted and self.strict_state:
             return ReplayResult(
                 False,
                 restored=restored,
-                error="missing state restorer(s): " + ", ".join(sorted(missing)),
-                metadata={
-                    "verified": False,
-                    "source": evidence.source,
-                    "missing_state": missing,
-                    "checkpoint_id": evidence.checkpoint_id,
-                    "checkpoint_step": evidence.checkpoint_step,
-                    "limitations": list(evidence.limitations),
-                },
+                error="missing state restorer(s): " + ", ".join(sorted(omitted)),
+                metadata=_report_metadata(
+                    report_evidence(),
+                    verified=False,
+                    status="incomplete",
+                    replay_status="incomplete",
+                    missing_state=list(omitted),
+                    **restoration_fields(),
+                ),
             )
         rng_state = {name: value for name, value in evidence.state.items() if name in _RNG_KEYS}
         if rng_state:
-            restored.extend(restore_rng_state(rng_state))
+            restored_rng_values, rng_failures = _restore_rng_state_detailed(rng_state)
+            restored.extend(item for item in restored_rng_values if item not in restored)
             restored_rng = {
                 "Python RNG"
                 if name == "python"
@@ -680,20 +1316,26 @@ class ReplayEngine:
                 for name in rng_state
             }
             missing_rng = sorted(restored_rng.difference(restored))
-            if missing_rng and self.strict_state:
-                return ReplayResult(
-                    False,
-                    restored=restored,
-                    error="failed to restore RNG state: " + ", ".join(missing_rng),
-                    metadata={
-                        "verified": False,
-                        "source": evidence.source,
-                        "missing_rng_state": missing_rng,
-                        "checkpoint_id": evidence.checkpoint_id,
-                        "checkpoint_step": evidence.checkpoint_step,
-                        "limitations": list(evidence.limitations),
-                    },
+            if rng_failures:
+                limitations.extend(
+                    f"RNG state restoration incomplete: {failure}" for failure in rng_failures
                 )
+            if missing_rng:
+                omitted.extend(missing_rng)
+                if self.strict_state:
+                    return ReplayResult(
+                        False,
+                        restored=restored,
+                        error="failed to restore RNG state: " + ", ".join(missing_rng),
+                        metadata=_report_metadata(
+                            report_evidence(),
+                            verified=False,
+                            status="incomplete",
+                            replay_status="incomplete",
+                            missing_rng_state=missing_rng,
+                            **restoration_fields(),
+                        ),
+                    )
         # A logical seed is only a fallback.  Reseeding after an exact RNG
         # restore would silently destroy the captured random stream.
         restored_rng_labels = {
@@ -707,16 +1349,29 @@ class ReplayEngine:
             random.seed(evidence.seed)
             restored.append("Python RNG seed")
 
-        argument = evidence.input if evidence.has_input else incident
-        input_digest = _value_digest(argument) if evidence.has_input else None
-        try:
-            result = _invoke_runner(
-                runner, argument, evidence.has_input or argument is not None, evidence.seed
-            )
-        except BaseException as exc:
-            failure = exception_signature(exc)
+        planned = list(evidence.execution_steps)
+        if not planned:
+            argument = evidence.input if evidence.has_input else incident
+            planned = ((evidence.executed_step, argument),)
+        target_argument = planned[-1][1]
+        input_digest = _value_digest(target_argument) if evidence.has_input else None
+        executed_steps: list[int | float | None] = []
+        result: Any = None
+
+        def outcome_from_exception(exc: BaseException) -> ReplayResult:
+            if isinstance(exc, _ReplayTimeout):
+                failure = FailureSignature.structured("timeout", message="operation timed out")
+                status = "timeout"
+            else:
+                failure = exception_signature(exc)
+                status = "failure"
             if evidence.expected is not None:
                 reproduced = evidence.expected.matches(failure)
+                # ``verified`` answers whether the observed outcome was
+                # compared with explicit failure evidence.  State fidelity is
+                # reported independently as ``state_restoration_verified``;
+                # an opted-out/partial replay can therefore verify a matching
+                # failure without claiming that every provider was restored.
                 verified = True
                 error = None if reproduced else "replay raised a different failure"
             else:
@@ -731,30 +1386,42 @@ class ReplayEngine:
                 restored=restored,
                 error=error,
                 metadata=_report_metadata(
-                    evidence,
+                    report_evidence(),
                     input_digest=input_digest,
                     verified=verified,
+                    status=(
+                        status
+                        if restoration_fields()["state_restoration_verified"]
+                        else "incomplete-replay"
+                    ),
+                    replay_status=(
+                        status
+                        if restoration_fields()["state_restoration_verified"]
+                        else "incomplete"
+                    ),
                     expected=evidence.expected.to_dict() if evidence.expected else None,
-                    state_restoration_verified=True,
+                    executed_steps=executed_steps,
+                    **restoration_fields(),
                 ),
             )
 
-        reported_failure: FailureSignature | None = None
-        if isinstance(result, FailureSignature):
-            reported_failure = result
-        elif isinstance(result, Mapping):
-            for key in ("failure", "failure_signature", "signature"):
-                candidate = result.get(key)
-                if candidate is None:
-                    continue
-                try:
-                    reported_failure = _failure(candidate)
-                except (TypeError, ValueError):
-                    reported_failure = None
-                if reported_failure is not None:
-                    break
+        try:
+            with _replay_runtime_context(evidence, limitations):
+                for step, argument in planned:
+                    has_argument = evidence.has_input or argument is not None
+                    result = _invoke_with_timeout(
+                        runner, argument, has_argument, evidence.seed, effective_timeout
+                    )
+                    executed_steps.append(step)
+        except BaseException as exc:
+            if len(executed_steps) < len(planned):
+                executed_steps.append(planned[len(executed_steps)][0])
+            return outcome_from_exception(exc)
+
+        reported_failure = _failure_from_result(result)
         if reported_failure is not None and evidence.expected is not None:
             reproduced = evidence.expected.matches(reported_failure)
+            state_verified = bool(restoration_fields()["state_restoration_verified"])
             return ReplayResult(
                 reproduced,
                 failure=reported_failure,
@@ -762,26 +1429,33 @@ class ReplayEngine:
                 restored=restored,
                 error=None if reproduced else "replay reported a different failure",
                 metadata=_report_metadata(
-                    evidence,
+                    report_evidence(),
                     input_digest=input_digest,
                     verified=True,
+                    status="failure" if state_verified else "incomplete-replay",
+                    replay_status="failure" if state_verified else "incomplete",
                     expected=evidence.expected.to_dict(),
                     structured_result=True,
-                    state_restoration_verified=True,
+                    executed_steps=executed_steps,
+                    **restoration_fields(),
                 ),
             )
         if evidence.expected is not None:
+            state_verified = bool(restoration_fields()["state_restoration_verified"])
             return ReplayResult(
                 False,
                 result=result,
                 restored=restored,
                 error="expected failure did not occur",
                 metadata=_report_metadata(
-                    evidence,
+                    report_evidence(),
                     input_digest=input_digest,
                     verified=True,
+                    status="success" if state_verified else "incomplete-replay",
+                    replay_status="success" if state_verified else "incomplete",
                     expected=evidence.expected.to_dict(),
-                    state_restoration_verified=True,
+                    executed_steps=executed_steps,
+                    **restoration_fields(),
                 ),
             )
         try:
@@ -795,6 +1469,17 @@ class ReplayEngine:
             else:
                 reproduced = False
                 verified = False
+            status = "failure" if reproduced else "success"
+            if str(getattr(result, "status", "")).casefold() in {"timeout", "timed_out"}:
+                status = "timeout"
+            if isinstance(result, Mapping) and str(result.get("status", "")).casefold() in {
+                "timeout",
+                "timed_out",
+            }:
+                status = "timeout"
+            if not restoration_fields()["state_restoration_verified"]:
+                verified = False
+                status = "incomplete-replay"
         except Exception as exc:
             return ReplayResult(
                 False,
@@ -802,10 +1487,13 @@ class ReplayEngine:
                 restored=restored,
                 error=f"replay predicate failed: {type(exc).__name__}: {exc}",
                 metadata=_report_metadata(
-                    evidence,
+                    report_evidence(),
                     input_digest=input_digest,
                     verified=False,
-                    state_restoration_verified=True,
+                    status="incomplete",
+                    replay_status="incomplete",
+                    executed_steps=executed_steps,
+                    **restoration_fields(),
                 ),
             )
         return ReplayResult(
@@ -813,11 +1501,14 @@ class ReplayEngine:
             result=result,
             restored=restored,
             metadata=_report_metadata(
-                evidence,
+                report_evidence(),
                 input_digest=input_digest,
                 verified=verified,
+                status=status,
+                replay_status=status.removesuffix("-replay"),
                 expected=None,
-                state_restoration_verified=True,
+                executed_steps=executed_steps,
+                **restoration_fields(),
             ),
         )
 

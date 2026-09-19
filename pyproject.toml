@@ -46,6 +46,17 @@ mlforensics = "mlforensics.cli.main:main"
 [tool.hatch.build.targets.wheel]
 packages = ["mlforensics"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+  "mlforensics",
+  "README.md",
+  "CHANGELOG.md",
+  "SECURITY.md",
+  "CONTRIBUTING.md",
+  "LICENSE",
+  "pyproject.toml",
+]
+
 [tool.hatch.version]
 path = "mlforensics/__about__.py"
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,6 +17,19 @@ CHILD_RESULT_ENV = "MLFORENSICS_CHILD_RESULT"
 CHILD_CAPSULE_ENV = "MLFORENSICS_CHILD_CAPSULE"
 REPLAY_CAPSULE_ENV = "MLFORENSICS_REPLAY_CAPSULE"
 REPLAY_STEP_ENV = "MLFORENSICS_REPLAY_STEP"
+
+
+def _reject_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON constant {value!r}")
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        result[key] = value
+    return result
 
 
 @dataclass(frozen=True)
@@ -33,13 +48,48 @@ class ExecutionSpec:
         if isinstance(self.command, str):
             if not self.command.strip():
                 raise ValidationError("command must be a non-empty string")
+        elif isinstance(self.command, (str, bytes, bytearray)):
+            raise ValidationError("command must be a sequence of argument strings")
         else:
             converted = tuple(str(item) for item in self.command)
             if not converted or any(not item.strip() for item in converted):
                 raise ValidationError("command must contain non-empty strings")
             object.__setattr__(self, "command", converted)
+        if self.working_directory is not None and not isinstance(self.working_directory, str):
+            raise ValidationError("working_directory must be a string or None")
+        if self.seed is not None and (
+            isinstance(self.seed, bool) or not isinstance(self.seed, int)
+        ):
+            raise ValidationError("seed must be an integer or None")
+        if self.timeout is not None and (
+            isinstance(self.timeout, bool)
+            or not isinstance(self.timeout, (int, float))
+            or not math.isfinite(float(self.timeout))
+            or self.timeout <= 0
+        ):
+            raise ValidationError("timeout must be a positive finite number or None")
+        if self.capsule is not None and not isinstance(self.capsule, str):
+            raise ValidationError("capsule must be a string or None")
         object.__setattr__(self, "identity", _metadata(self.identity))
         object.__setattr__(self, "metadata", _metadata(self.metadata))
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ExecutionSpec:
+        if data.get("schema_version", SCHEMA_VERSION) != SCHEMA_VERSION:
+            raise ValidationError("unsupported execution spec schema version")
+        if data.get("type") not in {None, "execution_spec"}:
+            raise ValidationError("not an execution_spec record")
+        if "command" not in data:
+            raise ValidationError("execution spec is missing command")
+        return cls(
+            command=data["command"],
+            working_directory=data.get("working_directory"),
+            seed=data.get("seed"),
+            timeout=data.get("timeout"),
+            identity=data.get("identity", {}),
+            capsule=data.get("capsule"),
+            metadata=data.get("metadata", {}),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         command = self.command if isinstance(self.command, str) else list(self.command)
@@ -71,6 +121,17 @@ class ExecutionResult:
 
     def __post_init__(self) -> None:
         _str(self.status, "status")
+        if self.returncode is not None and (
+            isinstance(self.returncode, bool) or not isinstance(self.returncode, int)
+        ):
+            raise ValidationError("returncode must be an integer or None")
+        if self.failure is not None and not isinstance(self.failure, FailureSignature):
+            raise ValidationError("failure must be a FailureSignature or None")
+        for value, label in ((self.error, "error"), (self.capsule, "capsule")):
+            if value is not None and not isinstance(value, str):
+                raise ValidationError(f"{label} must be a string or None")
+        if not isinstance(self.unresolved, bool):
+            raise ValidationError("unresolved must be a boolean")
         object.__setattr__(self, "resources", _metadata(self.resources))
         object.__setattr__(self, "metadata", _metadata(self.metadata))
 
@@ -90,20 +151,22 @@ class ExecutionResult:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ExecutionResult:
+        if data.get("schema_version", SCHEMA_VERSION) != SCHEMA_VERSION:
+            raise ValidationError("unsupported execution result schema version")
         if data.get("type") not in {None, "execution_result"}:
             raise ValidationError("not an execution_result record")
         failure = data.get("failure")
+        if failure is not None and not isinstance(failure, Mapping):
+            raise ValidationError("failure must be a failure signature object or None")
         return cls(
-            status=str(data.get("status", "inconclusive")),
+            status=data.get("status", "inconclusive"),
             returncode=data.get("returncode"),
             failure=FailureSignature.from_dict(failure) if isinstance(failure, Mapping) else None,
             error=data.get("error"),
-            resources=data.get("resources", {})
-            if isinstance(data.get("resources"), Mapping)
-            else {},
+            resources=data.get("resources", {}),
             capsule=data.get("capsule"),
-            unresolved=bool(data.get("unresolved", False)),
-            metadata=data.get("metadata", {}) if isinstance(data.get("metadata"), Mapping) else {},
+            unresolved=data.get("unresolved", False),
+            metadata=data.get("metadata", {}),
         )
 
 
@@ -336,12 +399,17 @@ class RunGroup:
 
 def write_child_result(path: str | Path, result: ExecutionResult) -> Path:
     """Atomically write a structured child result separate from stdout."""
+    if not isinstance(result, ExecutionResult):
+        raise TypeError("result must be an ExecutionResult")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(result.to_dict(), sort_keys=True, allow_nan=False, indent=2)
-    temporary = target.with_suffix(target.suffix + ".tmp")
-    temporary.write_text(payload + "\n", encoding="utf-8")
-    temporary.replace(target)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(payload + "\n", encoding="utf-8")
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
     return target
 
 
@@ -349,7 +417,11 @@ def load_child_result(path: str | Path) -> ExecutionResult:
     """Load a child result file. Malformed envelopes are unresolved."""
     source = Path(path)
     try:
-        raw = json.loads(source.read_text(encoding="utf-8"))
+        raw = json.loads(
+            source.read_text(encoding="utf-8"),
+            parse_constant=_reject_constant,
+            object_pairs_hook=_reject_duplicate_keys,
+        )
     except (OSError, TypeError, ValueError) as exc:
         raise UnresolvedEvaluation(f"malformed child result envelope: {exc}") from exc
     if not isinstance(raw, Mapping):

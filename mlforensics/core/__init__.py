@@ -1,6 +1,6 @@
 """Public core contracts and utilities."""
 
-from .capsule import RunCapsule
+from .capsule import RunCapsule, protocol_document, protocol_schema, protocol_schema_resource
 from .capture import CaptureContext, CaptureHook
 from .codecs import (
     CONTAINER_CODEC,
@@ -28,9 +28,13 @@ from .contracts import (
     ValidationPlan,
     WorkflowSession,
     evaluate_predicate,
+    load_child_result,
     normalize_predicate_result,
+    parse_failure_envelope,
+    write_child_result,
 )
 from .errors import CheckpointUnavailable, IncompleteReplay, UnresolvedEvaluation, ValidationError
+from .execution import ExecutionRecord, ExecutionService, persist_execution_record
 from .failure import exception_signature, normalize_exception_message, signature_from_record
 from .index import index_path, load_index, record_run, resolve_run
 from .models import (
@@ -75,7 +79,9 @@ __all__ = [
     "CONTAINER_CODEC",
     "Counterexample",
     "Budget",
+    "ExecutionRecord",
     "ExecutionResult",
+    "ExecutionService",
     "ExecutionSpec",
     "PluginDescriptor",
     "PredicateResult",
@@ -89,7 +95,10 @@ __all__ = [
     "digest_state_tree",
     "encode_state_tree",
     "evaluate_predicate",
+    "load_child_result",
     "normalize_predicate_result",
+    "parse_failure_envelope",
+    "persist_execution_record",
     "DatasetRef",
     "EncodedState",
     "EvidenceState",
@@ -111,6 +120,9 @@ __all__ = [
     "ResourceSeries",
     "Run",
     "RunCapsule",
+    "protocol_document",
+    "protocol_schema",
+    "protocol_schema_resource",
     "record_run",
     "ReplayPlan",
     "resolve_run",
@@ -132,5 +144,6 @@ __all__ = [
     "compatible_exception_types",
     "utc_now",
     "validate",
+    "write_child_result",
     "default_state_codecs",
 ]

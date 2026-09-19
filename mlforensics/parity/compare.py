@@ -22,29 +22,60 @@ class Tolerance:
     relative: float
     nan_equal: bool
     inf_equal: bool
+    precision: str | None
+
+    # These are intentionally conservative defaults.  They describe the
+    # precision loss normally introduced by each representation, rather than
+    # attempting to make every output pass.
+    PROFILES = {
+        "fp32": (1e-6, 1e-5),
+        "float32": (1e-6, 1e-5),
+        "single": (1e-6, 1e-5),
+        "fp16": (1e-3, 1e-2),
+        "float16": (1e-3, 1e-2),
+        "half": (1e-3, 1e-2),
+        "bf16": (2e-2, 2e-2),
+        "bfloat16": (2e-2, 2e-2),
+        "bfloat": (2e-2, 2e-2),
+    }
 
     def __init__(
         self,
-        absolute: float = 1e-6,
-        relative: float = 1e-5,
+        absolute: float | None = None,
+        relative: float | None = None,
         *,
         atol: float | None = None,
         rtol: float | None = None,
         abs_tol: float | None = None,
         rel_tol: float | None = None,
+        precision: str | None = None,
+        profile: str | None = None,
         nan_equal: bool = False,
         inf_equal: bool = True,
     ) -> None:
-        absolute = (
-            absolute
-            if atol is None and abs_tol is None
-            else (atol if atol is not None else abs_tol)
-        )
-        relative = (
-            relative
-            if rtol is None and rel_tol is None
-            else (rtol if rtol is not None else rel_tol)
-        )
+        if precision is not None and profile is not None:
+            if self._normalise_precision(precision) != self._normalise_precision(profile):
+                raise ValueError("precision and profile must agree when both are supplied")
+        precision = precision if precision is not None else profile
+        if precision is not None:
+            precision = self._normalise_precision(precision)
+            profile_atol, profile_rtol = self.PROFILES[precision]
+            if absolute is None and atol is None and abs_tol is None:
+                absolute = profile_atol
+            if relative is None and rtol is None and rel_tol is None:
+                relative = profile_rtol
+        if atol is not None:
+            absolute = atol
+        elif abs_tol is not None:
+            absolute = abs_tol
+        elif absolute is None:
+            absolute = 1e-6
+        if rtol is not None:
+            relative = rtol
+        elif rel_tol is not None:
+            relative = rel_tol
+        elif relative is None:
+            relative = 1e-5
         if absolute is None or relative is None:
             raise ValueError("tolerance values cannot be None")
         if (
@@ -60,6 +91,46 @@ class Tolerance:
         object.__setattr__(self, "relative", float(relative))
         object.__setattr__(self, "nan_equal", nan_equal)
         object.__setattr__(self, "inf_equal", inf_equal)
+        object.__setattr__(self, "precision", precision)
+
+    @classmethod
+    def _normalise_precision(cls, precision: str) -> str:
+        name = str(precision).casefold().replace("-", "").replace("_", "")
+        aliases = {
+            "float32": "fp32",
+            "single": "fp32",
+            "fp32": "fp32",
+            "float16": "fp16",
+            "half": "fp16",
+            "fp16": "fp16",
+            "bfloat16": "bf16",
+            "bfloat": "bf16",
+            "bf16": "bf16",
+        }
+        canonical = aliases.get(name, name)
+        if canonical not in cls.PROFILES:
+            raise ValueError("precision must be one of fp32, fp16, or bf16")
+        return canonical
+
+    @classmethod
+    def from_profile(cls, profile: str, **kwargs: Any) -> Tolerance:
+        return cls(profile=profile, **kwargs)
+
+    @classmethod
+    def for_precision(cls, precision: str, **kwargs: Any) -> Tolerance:
+        return cls(precision=precision, **kwargs)
+
+    @classmethod
+    def fp32(cls, **kwargs: Any) -> Tolerance:
+        return cls(profile="fp32", **kwargs)
+
+    @classmethod
+    def fp16(cls, **kwargs: Any) -> Tolerance:
+        return cls(profile="fp16", **kwargs)
+
+    @classmethod
+    def bf16(cls, **kwargs: Any) -> Tolerance:
+        return cls(profile="bf16", **kwargs)
 
     @property
     def atol(self) -> float:
@@ -68,6 +139,11 @@ class Tolerance:
     @property
     def rtol(self) -> float:
         return self.relative
+
+    @property
+    def profile(self) -> str | None:
+        """Alias for the selected precision profile."""
+        return self.precision
 
 
 Tolerances = Tolerance
@@ -81,6 +157,11 @@ class OutputComparison:
     mismatch_count: int = 0
     mismatch_paths: tuple[str, ...] = ()
     reason: str | None = None
+    expected_shape: tuple[int | None, ...] | None = None
+    actual_shape: tuple[int | None, ...] | None = None
+    expected_dtype: str | None = None
+    actual_dtype: str | None = None
+    tolerance_profile: str | None = None
 
     @property
     def passed(self) -> bool:
@@ -105,6 +186,13 @@ class OutputComparison:
             "mismatch_count": self.mismatch_count,
             "mismatch_paths": list(self.mismatch_paths),
             "reason": self.reason,
+            "expected_shape": list(self.expected_shape)
+            if self.expected_shape is not None
+            else None,
+            "actual_shape": list(self.actual_shape) if self.actual_shape is not None else None,
+            "expected_dtype": self.expected_dtype,
+            "actual_dtype": self.actual_dtype,
+            "tolerance_profile": self.tolerance_profile,
         }
 
 
@@ -149,10 +237,22 @@ def _report_value(value: Any) -> Any:
     return plain
 
 
+def _precision_from_values(*values: Any) -> str | None:
+    """Infer a supported floating-point profile from array/tensor dtypes."""
+    dtypes = [_dtype_of(value).casefold() for value in values if _dtype_of(value)]
+    if any("bfloat16" in dtype for dtype in dtypes):
+        return "bfloat16"
+    if any("float16" in dtype or dtype in {"half", "fp16"} for dtype in dtypes):
+        return "float16"
+    if any("float32" in dtype or dtype in {"single", "fp32"} for dtype in dtypes):
+        return "float32"
+    return None
+
+
 def compare_outputs(
     expected: Any,
     actual: Any,
-    tolerance: Tolerance | None = None,
+    tolerance: Tolerance | Mapping[str, Any] | str | None = None,
     *,
     absolute_tolerance: float | None = None,
     relative_tolerance: float | None = None,
@@ -160,9 +260,24 @@ def compare_outputs(
     rtol: float | None = None,
     abs_tol: float | None = None,
     rel_tol: float | None = None,
+    precision: str | None = None,
+    profile: str | None = None,
+    output_tolerances: Mapping[str, Any] | None = None,
+    tolerance_profiles: Mapping[str, Any] | None = None,
+    dtype_policy: str = "ignore",
+    check_dtype: bool | None = None,
+    precision_aware: bool = False,
+    order: str = "strict",
+    ignore_order: bool | None = None,
     path: str = "$",
 ) -> OutputComparison:
-    """Compare scalar, vector, mapping, tuple, tensor, or array outputs."""
+    """Compare scalar, vector, mapping, tuple, tensor, or array outputs.
+
+    ``tolerance`` can be a global policy, a precision profile name, or a map
+    from output names/paths to policies.  Dtypes are ignored by default so
+    numerically equivalent float32 and float64 outputs remain compatible;
+    ``dtype_policy='strict'`` makes dtype part of the output contract.
+    """
 
     absolute_tolerance = (
         absolute_tolerance
@@ -174,19 +289,154 @@ def compare_outputs(
         if relative_tolerance is not None
         else (rtol if rtol is not None else rel_tol)
     )
-    if tolerance is None:
-        tolerance = Tolerance(
-            absolute=1e-6 if absolute_tolerance is None else absolute_tolerance,
-            relative=1e-5 if relative_tolerance is None else relative_tolerance,
+    if ignore_order is not None:
+        order = "ignore" if ignore_order else "strict"
+    order = str(order).casefold().replace("-", "_")
+    if order in {"ordered", "sensitive", "strict"}:
+        order = "strict"
+    elif order in {"unordered", "insensitive", "ignore", "ignored"}:
+        order = "ignore"
+    else:
+        raise ValueError("order must be 'strict' or 'ignore'")
+    if check_dtype is not None:
+        dtype_policy = "strict" if check_dtype else "ignore"
+    dtype_policy = str(dtype_policy).casefold().replace("-", "_")
+    if dtype_policy in {"none", "off", "ignore", "ignored"}:
+        dtype_policy = "ignore"
+    elif dtype_policy in {"exact", "strict", "required"}:
+        dtype_policy = "strict"
+    else:
+        raise ValueError("dtype_policy must be 'ignore' or 'strict'")
+
+    profile_value = precision if precision is not None else profile
+    if profile_value is not None and str(profile_value).casefold() == "auto":
+        profile_value = _precision_from_values(expected, actual)
+    elif precision_aware and profile_value is None:
+        profile_value = _precision_from_values(expected, actual)
+    base_tolerance = _coerce_tolerance(tolerance, precision=profile_value)
+    output_map = _normalise_tolerance_map(tolerance)
+    if output_tolerances is not None:
+        output_map = {
+            **(output_map or {}),
+            **{str(key): _coerce_tolerance(value) for key, value in output_tolerances.items()},
+        }
+    if tolerance_profiles:
+        output_map = {
+            **(output_map or {}),
+            **{str(key): _coerce_tolerance(value) for key, value in tolerance_profiles.items()},
+        }
+    if absolute_tolerance is not None or relative_tolerance is not None:
+        base_tolerance = Tolerance(
+            absolute=(
+                base_tolerance.absolute if absolute_tolerance is None else absolute_tolerance
+            ),
+            relative=(
+                base_tolerance.relative if relative_tolerance is None else relative_tolerance
+            ),
+            nan_equal=base_tolerance.nan_equal,
+            inf_equal=base_tolerance.inf_equal,
+            precision=base_tolerance.precision,
         )
-    elif absolute_tolerance is not None or relative_tolerance is not None:
-        tolerance = Tolerance(
-            absolute=tolerance.absolute if absolute_tolerance is None else absolute_tolerance,
-            relative=tolerance.relative if relative_tolerance is None else relative_tolerance,
-            nan_equal=tolerance.nan_equal,
-            inf_equal=tolerance.inf_equal,
+    resolver = _ToleranceResolver(base_tolerance, output_map)
+    return _compare(expected, actual, resolver, path, dtype_policy=dtype_policy, order=order)
+
+
+def _coerce_tolerance(value: Any = None, *, precision: str | None = None) -> Tolerance:
+    """Convert the flexible public tolerance forms to a policy."""
+    if isinstance(value, Tolerance):
+        return value
+    if isinstance(value, str):
+        return Tolerance(profile=value)
+    if isinstance(value, Mapping):
+        fields = {
+            "absolute",
+            "relative",
+            "atol",
+            "rtol",
+            "abs_tol",
+            "rel_tol",
+            "precision",
+            "profile",
+            "nan_equal",
+            "inf_equal",
+        }
+        if fields.intersection(value):
+            return Tolerance(**dict(value))
+    return Tolerance(precision=precision)
+
+
+def _normalise_tolerance_map(value: Any) -> dict[str, Tolerance] | None:
+    if not isinstance(value, Mapping):
+        return None
+    fields = {
+        "absolute",
+        "relative",
+        "atol",
+        "rtol",
+        "abs_tol",
+        "rel_tol",
+        "precision",
+        "profile",
+        "nan_equal",
+        "inf_equal",
+    }
+    if fields.intersection(value):
+        return None
+    return {str(key): _coerce_tolerance(item) for key, item in value.items()}
+
+
+class _ToleranceResolver:
+    def __init__(self, default: Tolerance, policies: Mapping[str, Tolerance] | None) -> None:
+        self.default = default
+        self.policies = policies or {}
+
+    def for_path(self, path: str) -> Tolerance:
+        if not self.policies:
+            return self.default
+        candidates = [path]
+        if path.startswith("$['"):
+            closing = path.find("']")
+            if closing > 3:
+                root = path[3:closing]
+                candidates.extend((root, "$." + root, path[: closing + 2]))
+        if path.startswith("$[") and path.endswith("]"):
+            candidates.append(path[2:-1].strip("'\""))
+        if path.startswith("$."):
+            candidates.append(path[2:])
+        candidates.extend(("$", "*"))
+        for candidate in candidates:
+            if candidate in self.policies:
+                return self.policies[candidate]
+        prefixes = sorted(
+            (key for key in self.policies if path.startswith(key + "[")),
+            key=len,
+            reverse=True,
         )
-    return _compare(_plain(expected), _plain(actual), tolerance, path)
+        return self.policies[prefixes[0]] if prefixes else self.default
+
+
+def _example_tolerance(
+    default: Any,
+    policies: Mapping[Any, Any] | Callable[..., Any] | None,
+    *,
+    index: int,
+    case: InputCase,
+) -> Any:
+    """Resolve a case policy by index, label, category, or callback."""
+    if policies is None:
+        return default
+    if callable(policies):
+        try:
+            return policies(case=case, index=index)
+        except TypeError:
+            try:
+                return policies(case, index)
+            except TypeError:
+                return policies(case)
+    for key in (index, case.label, case.category, "*", str(index)):
+        if key in policies:
+            return policies[key]
+    return default
 
 
 def _failed(
@@ -211,7 +461,109 @@ def _combine(parts: list[OutputComparison]) -> OutputComparison:
     )
 
 
-def _compare(expected: Any, actual: Any, tolerance: Tolerance, path: str) -> OutputComparison:
+def _shape_of(value: Any) -> tuple[int | None, ...] | None:
+    """Return a portable shape for arrays and nested Python sequences."""
+    shape = getattr(value, "shape", None)
+    if shape is not None and not isinstance(value, (str, bytes)):
+        try:
+            return tuple(int(dimension) for dimension in shape)
+        except (TypeError, ValueError):
+            pass
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return (0,)
+        child_shapes = [_shape_of(item) for item in value]
+        first = child_shapes[0]
+        if all(item == first for item in child_shapes):
+            return (len(value),) + (first or ())
+        return (len(value), None)
+    return None
+
+
+def _dtype_of(value: Any) -> str | None:
+    dtype = getattr(value, "dtype", None)
+    if dtype is None:
+        return None
+    return str(dtype)
+
+
+def _output_root(path: str) -> str:
+    """Collapse an element mismatch path to its top-level output name."""
+    if path == "$" or not path.startswith("$"):
+        return path
+    if path.startswith("$['"):
+        closing = path.find("']")
+        if closing > 3:
+            return path[: closing + 2]
+    if path.startswith("$."):
+        return path[2:].split(".", 1)[0]
+    if path.startswith("$["):
+        closing = path.find("]")
+        if closing > 2:
+            return path[: closing + 1]
+    return "$"
+
+
+def _is_arrayish(value: Any) -> bool:
+    return not isinstance(value, (str, bytes, list, tuple, Mapping)) and (
+        getattr(value, "shape", None) is not None
+        or callable(getattr(value, "tolist", None))
+        or callable(getattr(value, "detach", None))
+    )
+
+
+def _compare(
+    expected: Any,
+    actual: Any,
+    resolver: _ToleranceResolver,
+    path: str,
+    *,
+    dtype_policy: str = "ignore",
+    order: str = "strict",
+) -> OutputComparison:
+    expected_shape = _shape_of(expected)
+    actual_shape = _shape_of(actual)
+    expected_dtype = _dtype_of(expected)
+    actual_dtype = _dtype_of(actual)
+    if expected_shape is not None and actual_shape is not None and expected_shape != actual_shape:
+        return OutputComparison(
+            False,
+            mismatch_count=1,
+            mismatch_paths=(path,),
+            reason=f"output shape differs: {expected_shape} != {actual_shape}",
+            expected_shape=expected_shape,
+            actual_shape=actual_shape,
+            expected_dtype=expected_dtype,
+            actual_dtype=actual_dtype,
+        )
+    if (
+        dtype_policy == "strict"
+        and expected_dtype is not None
+        and actual_dtype is not None
+        and expected_dtype != actual_dtype
+    ):
+        return OutputComparison(
+            False,
+            mismatch_count=1,
+            mismatch_paths=(path,),
+            reason=f"output dtype differs: {expected_dtype} != {actual_dtype}",
+            expected_shape=expected_shape,
+            actual_shape=actual_shape,
+            expected_dtype=expected_dtype,
+            actual_dtype=actual_dtype,
+        )
+
+    # Normalize only after inspecting metadata.  This keeps tensor/array
+    # support optional and allows the scalar comparator below to stay tiny.
+    if _is_arrayish(expected) or _is_arrayish(actual):
+        expected = _plain(expected)
+        actual = _plain(actual)
+
+    if expected is None or actual is None:
+        if expected is None and actual is None:
+            return OutputComparison(True)
+        return _failed(path, "null output differs")
+
     if isinstance(expected, Mapping) or isinstance(actual, Mapping):
         if not isinstance(expected, Mapping) or not isinstance(actual, Mapping):
             return _failed(path, "output container type differs")
@@ -221,7 +573,16 @@ def _compare(expected: Any, actual: Any, tolerance: Tolerance, path: str) -> Out
         for key in sorted(actual.keys() - expected.keys(), key=repr):
             parts.append(_failed(f"{path}[{key!r}]", "unexpected output key"))
         for key in sorted(expected.keys() & actual.keys(), key=repr):
-            parts.append(_compare(expected[key], actual[key], tolerance, f"{path}[{key!r}]"))
+            parts.append(
+                _compare(
+                    expected[key],
+                    actual[key],
+                    resolver,
+                    f"{path}[{key!r}]",
+                    dtype_policy=dtype_policy,
+                    order=order,
+                )
+            )
         return _combine(parts)
 
     sequence_types = (list, tuple)
@@ -230,9 +591,40 @@ def _compare(expected: Any, actual: Any, tolerance: Tolerance, path: str) -> Out
             return _failed(path, "output container type differs")
         if len(expected) != len(actual):
             return _failed(path, f"output length differs: {len(expected)} != {len(actual)}")
+        if order == "ignore":
+            unmatched = list(actual)
+            parts = []
+            for expected_index, expected_item in enumerate(expected):
+                match_index = next(
+                    (
+                        index
+                        for index, actual_item in enumerate(unmatched)
+                        if _compare(
+                            expected_item,
+                            actual_item,
+                            resolver,
+                            f"{path}[{expected_index}]",
+                            dtype_policy=dtype_policy,
+                            order=order,
+                        ).equal
+                    ),
+                    None,
+                )
+                if match_index is None:
+                    parts.append(_failed(f"{path}[{expected_index}]", "unordered output differs"))
+                else:
+                    unmatched.pop(match_index)
+            return _combine(parts)
         return _combine(
             [
-                _compare(a, b, tolerance, f"{path}[{i}]")
+                _compare(
+                    a,
+                    b,
+                    resolver,
+                    f"{path}[{i}]",
+                    dtype_policy=dtype_policy,
+                    order=order,
+                )
                 for i, (a, b) in enumerate(zip(expected, actual))
             ]
         )
@@ -246,6 +638,7 @@ def _compare(expected: Any, actual: Any, tolerance: Tolerance, path: str) -> Out
 
     if isinstance(expected, Number) and isinstance(actual, Number):
         try:
+            tolerance = resolver.for_path(path)
             expected_number = (
                 complex(expected) if isinstance(expected, complex) else float(expected)
             )
@@ -341,6 +734,8 @@ class ParityDivergence:
     baseline: Any
     candidate: Any
     metadata: dict[str, Any] = field(default_factory=dict)
+    example_index: int | None = None
+    output_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -350,6 +745,8 @@ class ParityDivergence:
             "baseline": self.baseline,
             "candidate": self.candidate,
             "metadata": self.metadata,
+            "example_index": self.example_index,
+            "output_path": self.output_path,
         }
 
 
@@ -385,6 +782,11 @@ class ParityReport:
             if result.passed:
                 continue
             comparison = result.comparison
+            output_path = (
+                comparison.mismatch_paths[0]
+                if comparison is not None and comparison.mismatch_paths
+                else None
+            )
             records.append(
                 ParityDivergence(
                     index=index,
@@ -397,13 +799,100 @@ class ParityReport:
                     baseline=result.reference_output,
                     candidate=result.candidate_output,
                     metadata=(
-                        result.localization
-                        if isinstance(result.localization, dict)
-                        else {"localization": result.localization}
+                        {
+                            **(
+                                result.localization
+                                if isinstance(result.localization, dict)
+                                else {"localization": result.localization}
+                            ),
+                            "mismatch_paths": (
+                                list(comparison.mismatch_paths) if comparison is not None else []
+                            ),
+                        }
                     ),
+                    example_index=index,
+                    output_path=output_path,
                 )
             )
-        return records[: self.max_divergences]
+        return sorted(
+            records,
+            key=lambda record: (record.max_absolute_error, record.max_relative_error),
+            reverse=True,
+        )[: self.max_divergences]
+
+    @property
+    def per_example_errors(self) -> list[dict[str, Any]]:
+        """Return one compact error record for every supplied example."""
+        return [
+            {
+                "index": index,
+                "label": result.label,
+                "category": result.category,
+                "passed": result.passed,
+                "max_absolute_error": (
+                    result.comparison.max_absolute_diff
+                    if result.comparison is not None
+                    else math.inf
+                    if result.error is not None
+                    else 0.0
+                ),
+                "max_relative_error": (
+                    result.comparison.max_relative_diff
+                    if result.comparison is not None
+                    else math.inf
+                    if result.error is not None
+                    else 0.0
+                ),
+                "mismatch_count": (
+                    result.comparison.mismatch_count if result.comparison is not None else 0
+                ),
+                "mismatch_paths": (
+                    list(result.comparison.mismatch_paths) if result.comparison is not None else []
+                ),
+                "error": result.error,
+            }
+            for index, result in enumerate(self.results)
+        ]
+
+    @property
+    def per_output_errors(self) -> dict[str, dict[str, Any]]:
+        """Aggregate divergence counts and worst errors by output path."""
+        output_errors: dict[str, dict[str, Any]] = {}
+        for result in self.results:
+            comparison = result.comparison
+            if comparison is None:
+                continue
+            paths = comparison.mismatch_paths or ("$",)
+            for path in paths:
+                output_path = _output_root(path)
+                record = output_errors.setdefault(
+                    output_path,
+                    {
+                        "count": 0,
+                        "max_absolute_error": 0.0,
+                        "max_relative_error": 0.0,
+                        "examples": [],
+                    },
+                )
+                record["count"] += 1
+                record["max_absolute_error"] = max(
+                    record["max_absolute_error"], comparison.max_absolute_diff
+                )
+                record["max_relative_error"] = max(
+                    record["max_relative_error"], comparison.max_relative_diff
+                )
+                record["examples"].append(result.label)
+        return output_errors
+
+    @property
+    def output_errors(self) -> dict[str, dict[str, Any]]:
+        """Backward-friendly short alias for :attr:`per_output_errors`."""
+        return self.per_output_errors
+
+    @property
+    def example_errors(self) -> list[dict[str, Any]]:
+        """Backward-friendly short alias for :attr:`per_example_errors`."""
+        return self.per_example_errors
 
     @property
     def divergent_count(self) -> int:
@@ -454,6 +943,11 @@ class ParityReport:
         if self.metadata.get("status"):
             return str(self.metadata["status"])
         return "pass" if self.passed else "fail"
+
+    @property
+    def exit_code(self) -> int:
+        """CLI-compatible status code: pass, failed parity, or unusable reference."""
+        return {"pass": 0, "fail": 1, "inconclusive": 2}.get(self.status, 2)
 
     @property
     def reference_valid(self) -> bool:
@@ -517,6 +1011,8 @@ class ParityReport:
             "failed_cases": self.fail_count,
             "errors": self.error_count,
             "mismatches": self.mismatch_count,
+            "per_example_errors": self.per_example_errors,
+            "per_output_errors": self.per_output_errors,
             "cases": [result.to_dict() for result in self.results],
         }
 
@@ -674,11 +1170,22 @@ def compare_models(
     candidate: Any,
     inputs: Iterable[Any] | None = None,
     *,
-    tolerance: Tolerance | None = None,
+    tolerance: Tolerance | Mapping[str, Any] | str | None = None,
     absolute_tolerance: float | None = None,
     relative_tolerance: float | None = None,
     atol: float | None = None,
     rtol: float | None = None,
+    precision: str | None = None,
+    profile: str | None = None,
+    output_tolerances: Mapping[str, Any] | None = None,
+    tolerance_profiles: Mapping[str, Any] | None = None,
+    example_tolerances: Mapping[Any, Any] | Callable[..., Any] | None = None,
+    per_example_tolerances: Mapping[Any, Any] | Callable[..., Any] | None = None,
+    dtype_policy: str = "ignore",
+    check_dtype: bool | None = None,
+    precision_aware: bool = False,
+    order: str = "strict",
+    ignore_order: bool | None = None,
     max_divergences: int = 100,
     localizer: Callable[..., Any] | None = None,
     localization_hook: Callable[..., Any] | None = None,
@@ -706,18 +1213,34 @@ def compare_models(
     cand = as_backend(candidate, name=candidate_name)
     if max_divergences < 0:
         raise ValueError("max_divergences must be non-negative")
-    tol = tolerance or Tolerance(
-        absolute=(
-            absolute_tolerance
-            if absolute_tolerance is not None
-            else (atol if atol is not None else 1e-6)
+    profile_value = precision if precision is not None else profile
+    tol = _coerce_tolerance(tolerance, precision=profile_value)
+    if absolute_tolerance is None:
+        absolute_tolerance = atol
+    if relative_tolerance is None:
+        relative_tolerance = rtol
+    if absolute_tolerance is not None or relative_tolerance is not None:
+        tol = Tolerance(
+            absolute=tol.absolute if absolute_tolerance is None else absolute_tolerance,
+            relative=tol.relative if relative_tolerance is None else relative_tolerance,
+            nan_equal=tol.nan_equal,
+            inf_equal=tol.inf_equal,
+            precision=tol.precision,
+        )
+    case_policies = per_example_tolerances or example_tolerances
+    configured_output_tolerances = {
+        **(_normalise_tolerance_map(tolerance) or {}),
+        **(
+            {str(key): _coerce_tolerance(value) for key, value in output_tolerances.items()}
+            if output_tolerances is not None
+            else {}
         ),
-        relative=(
-            relative_tolerance
-            if relative_tolerance is not None
-            else (rtol if rtol is not None else 1e-5)
+        **(
+            {str(key): _coerce_tolerance(value) for key, value in tolerance_profiles.items()}
+            if tolerance_profiles is not None
+            else {}
         ),
-    )
+    }
     hook = localizer or localization_hook
     generated = inputs is None
     parsed_input_spec: InputSpec | Mapping[str, InputSpec] | None = None
@@ -732,6 +1255,10 @@ def compare_models(
             input_dtype = parsed_input_spec.dtype
     if input_dtype is None:
         input_dtype = _infer_input_dtype(ref)
+    elif isinstance(input_dtype, str):
+        # Validate explicit CLI/API dtype values even when the caller supplies
+        # inputs rather than asking the generator to materialize an array.
+        InputSpec(dtype=input_dtype)
     cases = (
         generate_input_cases(
             shape=input_shape,
@@ -762,6 +1289,17 @@ def compare_models(
     results: list[ParityCaseResult] = []
     for index, case in enumerate(prepared_cases):
         result = ParityCaseResult(case.value, case.label, case.category)
+        selected_tolerance = _example_tolerance(
+            tolerance,
+            case_policies,
+            index=index,
+            case=case,
+        )
+        case_tolerance = _coerce_tolerance(selected_tolerance, precision=profile_value)
+        case_output_tolerances = {
+            **configured_output_tolerances,
+            **(_normalise_tolerance_map(selected_tolerance) or {}),
+        }
         error_stage: str | None = None
         error_type: type[BaseException] | None = None
         result.reference_output, reference_error = reference_results[index]
@@ -780,7 +1318,16 @@ def compare_models(
         try:
             if result.error is None:
                 result.comparison = compare_outputs(
-                    result.reference_output, result.candidate_output, tol
+                    result.reference_output,
+                    result.candidate_output,
+                    case_tolerance,
+                    output_tolerances=case_output_tolerances,
+                    tolerance_profiles=tolerance_profiles,
+                    dtype_policy=dtype_policy,
+                    check_dtype=check_dtype,
+                    precision_aware=precision_aware,
+                    order=order,
+                    ignore_order=ignore_order,
                 )
         except Exception as exc:
             error_stage = "comparison"
@@ -802,7 +1349,18 @@ def compare_models(
                     except Exception as exc:
                         return error_stage == "candidate" and type(exc) is error_type
                     try:
-                        compare_outputs(expected, actual, tol)
+                        compare_outputs(
+                            expected,
+                            actual,
+                            case_tolerance,
+                            output_tolerances=case_output_tolerances,
+                            tolerance_profiles=tolerance_profiles,
+                            dtype_policy=dtype_policy,
+                            check_dtype=check_dtype,
+                            precision_aware=precision_aware,
+                            order=order,
+                            ignore_order=ignore_order,
+                        )
                     except Exception as exc:
                         return error_stage == "comparison" and type(exc) is error_type
                     return False
@@ -815,7 +1373,18 @@ def compare_models(
                         actual = cand.predict(value)
                     except Exception:
                         return False
-                    return not compare_outputs(expected, actual, tol).equal
+                    return not compare_outputs(
+                        expected,
+                        actual,
+                        case_tolerance,
+                        output_tolerances=case_output_tolerances,
+                        tolerance_profiles=tolerance_profiles,
+                        dtype_policy=dtype_policy,
+                        check_dtype=check_dtype,
+                        precision_aware=precision_aware,
+                        order=order,
+                        ignore_order=ignore_order,
+                    ).equal
 
             try:
                 result.shrunk_input = shrink_input(case.value, still_fails, shrinker=shrinker)
@@ -872,6 +1441,11 @@ def compare_models(
             ),
             "reference_valid": reference_valid,
             "reference_error_count": sum(error is not None for _output, error in reference_results),
+            "tolerance_profile": tol.precision,
+            "output_tolerances": {
+                key: {"atol": value.absolute, "rtol": value.relative}
+                for key, value in configured_output_tolerances.items()
+            },
             "status": status,
         },
     )
@@ -882,7 +1456,7 @@ def compare_batch(
     candidate: Any,
     batches: Iterable[Sequence[Any]],
     *,
-    tolerance: Tolerance | None = None,
+    tolerance: Tolerance | Mapping[str, Any] | str | None = None,
     **kwargs: Any,
 ) -> ParityReport:
     """Compare backend batch predictions, one report case per batch item."""
@@ -891,10 +1465,45 @@ def compare_batch(
     candidate_name = kwargs.pop("candidate_name", None)
     ref = as_backend(reference, name=reference_name)
     cand = as_backend(candidate, name=candidate_name)
-    tol = tolerance or Tolerance(
-        absolute=kwargs.pop("absolute_tolerance", kwargs.pop("atol", kwargs.pop("abs_tol", 1e-6))),
-        relative=kwargs.pop("relative_tolerance", kwargs.pop("rtol", kwargs.pop("rel_tol", 1e-5))),
+    precision = kwargs.pop("precision", kwargs.pop("profile", None))
+    tol = _coerce_tolerance(tolerance, precision=precision)
+    absolute_tolerance = kwargs.pop(
+        "absolute_tolerance", kwargs.pop("atol", kwargs.pop("abs_tol", None))
     )
+    relative_tolerance = kwargs.pop(
+        "relative_tolerance", kwargs.pop("rtol", kwargs.pop("rel_tol", None))
+    )
+    if absolute_tolerance is not None or relative_tolerance is not None:
+        tol = Tolerance(
+            absolute=tol.absolute if absolute_tolerance is None else absolute_tolerance,
+            relative=tol.relative if relative_tolerance is None else relative_tolerance,
+            nan_equal=tol.nan_equal,
+            inf_equal=tol.inf_equal,
+            precision=tol.precision,
+        )
+    output_tolerances = kwargs.pop("output_tolerances", None)
+    tolerance_profiles = kwargs.pop("tolerance_profiles", None)
+    example_tolerances = kwargs.pop(
+        "per_example_tolerances", kwargs.pop("example_tolerances", None)
+    )
+    dtype_policy = kwargs.pop("dtype_policy", "ignore")
+    check_dtype = kwargs.pop("check_dtype", None)
+    precision_aware = kwargs.pop("precision_aware", False)
+    order = kwargs.pop("order", "strict")
+    ignore_order = kwargs.pop("ignore_order", None)
+    configured_output_tolerances = {
+        **(_normalise_tolerance_map(tolerance) or {}),
+        **(
+            {str(key): _coerce_tolerance(value) for key, value in output_tolerances.items()}
+            if output_tolerances is not None
+            else {}
+        ),
+        **(
+            {str(key): _coerce_tolerance(value) for key, value in tolerance_profiles.items()}
+            if tolerance_profiles is not None
+            else {}
+        ),
+    }
     localizer = kwargs.pop("localizer", kwargs.pop("localization_hook", None))
     shrinker = kwargs.pop("shrinker", None)
     shrink_failures = kwargs.pop("shrink_failures", False)
@@ -959,7 +1568,30 @@ def compare_batch(
         for item_index, (item, expected, actual) in enumerate(
             zip(batch, ref_outputs, cand_outputs)
         ):
-            comparison = compare_outputs(expected, actual, tol)
+            case = InputCase(item, f"batch-{batch_index}[{item_index}]", "batch")
+            selected_tolerance = _example_tolerance(
+                tolerance,
+                example_tolerances,
+                index=len(results),
+                case=case,
+            )
+            item_tolerance = _coerce_tolerance(selected_tolerance, precision=precision)
+            item_output_tolerances = {
+                **configured_output_tolerances,
+                **(_normalise_tolerance_map(selected_tolerance) or {}),
+            }
+            comparison = compare_outputs(
+                expected,
+                actual,
+                item_tolerance,
+                output_tolerances=item_output_tolerances,
+                tolerance_profiles=tolerance_profiles,
+                dtype_policy=dtype_policy,
+                check_dtype=check_dtype,
+                precision_aware=precision_aware,
+                order=order,
+                ignore_order=ignore_order,
+            )
             result = ParityCaseResult(
                 item,
                 f"batch-{batch_index}[{item_index}]",
@@ -974,7 +1606,16 @@ def compare_batch(
                 def still_fails(value: Any) -> bool:
                     try:
                         return not compare_outputs(
-                            ref.predict(value), cand.predict(value), tol
+                            ref.predict(value),
+                            cand.predict(value),
+                            item_tolerance,
+                            output_tolerances=item_output_tolerances,
+                            tolerance_profiles=tolerance_profiles,
+                            dtype_policy=dtype_policy,
+                            check_dtype=check_dtype,
+                            precision_aware=precision_aware,
+                            order=order,
+                            ignore_order=ignore_order,
                         ).equal
                     except Exception:
                         return False
@@ -1010,6 +1651,11 @@ def compare_batch(
                 for result in results
                 if result.error is not None and result.error.startswith("reference ")
             ),
+            "tolerance_profile": tol.precision,
+            "output_tolerances": {
+                key: {"atol": value.absolute, "rtol": value.relative}
+                for key, value in configured_output_tolerances.items()
+            },
             "status": (
                 "inconclusive"
                 if not results or not reference_valid
@@ -1054,4 +1700,5 @@ ParityChecker = ParityComparator
 ParityResult = ParityCaseResult
 ComparisonResult = OutputComparison
 TolerancePolicy = Tolerance
+ToleranceProfile = Tolerance
 parity = compare_models

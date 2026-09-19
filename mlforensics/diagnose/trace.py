@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 import weakref
 from collections import OrderedDict, deque
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -33,11 +34,22 @@ class TraceEvent(CoreTraceEvent):
 def _flatten(value: Any, limit: int = 200_000) -> list[float]:
     if hasattr(value, "detach"):
         try:
-            value = value.detach().cpu()
+            flatten = getattr(value, "flatten", None)
+            sampled = flatten() if callable(flatten) else value
+            numel = int(getattr(sampled, "numel", lambda: limit)())
+            if numel > limit:
+                step = max(1, numel // limit)
+                sampled = sampled.reshape(-1)[::step][:limit]
+            sampled = sampled.detach()
+            cpu = getattr(sampled, "cpu", None)
+            if callable(cpu):
+                sampled = cpu()
+            value = sampled
         except Exception:
-            pass
-    # Do not call ``tolist`` on a multi-gigabyte tensor only to discard nearly
-    # all of it.  Framework flatten/slice operations retain the hard bound.
+            try:
+                value = value.detach()
+            except Exception:
+                pass
     flatten = getattr(value, "flatten", None)
     if callable(flatten):
         try:
@@ -124,16 +136,34 @@ def tensor_event(
         element_count = math.prod(shape)
     dtype = str(getattr(value, "dtype", "")) or None
     device = str(getattr(value, "device", "")) or None
+    gradient_norm = extra.pop("gradient_norm", None)
+    if gradient_norm is None:
+        gradient = getattr(value, "grad", None) if getattr(value, "is_leaf", True) else None
+        if gradient is not None:
+            try:
+                gradient_values = _flatten(gradient)
+                gradient_norm = math.sqrt(sum(item * item for item in gradient_values))
+            except (TypeError, ValueError, OverflowError):
+                gradient_norm = None
+        elif event_type == "backward":
+            try:
+                gradient_norm = math.sqrt(sum(item * item for item in values))
+            except (TypeError, ValueError, OverflowError):
+                gradient_norm = None
     data = {
         "event_type": event_type,
         "shape": shape,
         "dtype": dtype,
         "device": device,
         "minimum": minimum,
+        "min": minimum,
         "maximum": maximum,
+        "max": maximum,
         "mean": average,
         "std": standard_deviation,
         "finite_fraction": len(finite) / len(values) if values else None,
+        "finite_percentage": (100.0 * len(finite) / len(values)) if values else None,
+        "gradient_norm": gradient_norm,
         "element_count": element_count,
         "inspected_count": len(values),
         "truncated": element_count is not None and element_count > len(values),
@@ -161,6 +191,7 @@ class TraceBuffer:
         self._events: deque[TraceEvent] = deque(maxlen=max_events)
         self._next_id = 0
         self._dropped = 0
+        self._evicted_ids: deque[str] = deque(maxlen=max_events * 2)
         self._first_abnormal: TraceEvent | None = None
 
     def record(self, event: TraceEvent | Mapping[str, Any]) -> TraceEvent:
@@ -190,6 +221,9 @@ class TraceBuffer:
         self._next_id += 1
         if len(self._events) == self.max_events:
             self._dropped += 1
+            evicted = self._events[0]
+            if evicted.tensor_id is not None:
+                self._evicted_ids.append(evicted.tensor_id)
         self._events.append(event)
         if event.is_abnormal and self._first_abnormal is None:
             self._first_abnormal = event
@@ -209,6 +243,8 @@ class TraceBuffer:
     first_abnormal_event = first_abnormal
 
     def around(self, event: TraceEvent | None = None, radius: int = 8) -> list[TraceEvent]:
+        if radius < 0:
+            raise ValueError("radius must be non-negative")
         records = list(self._events)
         event = event or self.first_abnormal()
         if event is None:
@@ -216,6 +252,12 @@ class TraceBuffer:
         try:
             index = records.index(event)
         except ValueError:
+            # The first abnormal event is deliberately retained as a
+            # diagnostic anchor even after ring eviction.  Its neighbours are
+            # necessarily only the newest retained records, but returning the
+            # anchor makes that limitation explicit to consumers.
+            if event is self._first_abnormal:
+                return [event, *records[-radius:]] if radius else [event]
             return records
         return records[max(0, index - radius) : index + radius + 1]
 
@@ -255,7 +297,7 @@ class TraceBuffer:
         visit(tensor_id)
         return ordered
 
-    def analyze(self) -> dict[str, Any]:
+    def analyze(self, *, radius: int = 8) -> dict[str, Any]:
         """Summarize the first anomaly and its retained causal path."""
         first = self.first_abnormal()
         ancestry = self.ancestry(first)
@@ -274,11 +316,31 @@ class TraceBuffer:
             if not item.data.get("parents")
             or all(str(parent) not in known for parent in item.data.get("parents", ()))
         ]
+        missing_explanations = [
+            {
+                "parent_id": parent,
+                "reason": (
+                    "evicted_from_ring_buffer"
+                    if parent in self._evicted_ids
+                    else "not_recorded_or_outside_trace_window"
+                ),
+                "explanation": (
+                    "the parent was observed before the bounded trace buffer window"
+                    if parent in self._evicted_ids
+                    else "no retained event with this parent id is available"
+                ),
+            }
+            for parent in missing
+        ]
+        window = self.around(first, radius=radius)
         return {
             "first_abnormal": first.to_dict() if first else None,
             "causal_path": [item.to_dict() for item in ancestry],
             "root_candidates": [item.to_dict() for item in roots],
             "missing_parents": missing,
+            "missing_parent_explanations": missing_explanations,
+            "causal_window": [item.to_dict() for item in window],
+            "window_radius": radius,
             "event_count": len(self._events),
             "dropped_events": self._dropped,
             "bounded": True,
@@ -363,40 +425,124 @@ class TensorTracer:
         return self.buffer.to_dict()
 
 
-def attach_torch_hooks(module: Any, tracer: TensorTracer) -> list[Any]:
+def attach_torch_hooks(
+    module: Any,
+    tracer: TensorTracer,
+    *,
+    backward: bool = False,
+    operators: Sequence[str] | None = None,
+) -> list[Any]:
     try:
         named_modules = module.named_modules()
     except AttributeError as exc:
         raise TypeError("module must expose named_modules()") from exc
+    allowed = set(operators) if operators is not None else None
     handles = []
     for name, child in named_modules:
         if not name:
             continue
+        if allowed is not None and name not in allowed and type(child).__name__ not in allowed:
+            continue
+        source = f"{type(child).__module__}.{type(child).__qualname__}"
+        source_location = None
+        try:
+            source_location = inspect.getfile(type(child))
+            source = f"{source} ({source_location})"
+        except (OSError, TypeError):
+            pass
 
-        def hook(_child: Any, _inputs: Any, output: Any, operation: str = name) -> None:
+        def forward_hook(
+            _child: Any,
+            _inputs: Any,
+            output: Any,
+            operation: str = name,
+            origin: str = source,
+        ) -> None:
             tracer.record(
                 operation,
                 output,
                 inputs=_inputs,
-                source=f"{type(_child).__module__}.{type(_child).__qualname__}",
+                source=origin,
+                module=operation,
+                source_location=source_location,
+                phase="forward",
             )
 
         try:
-            handles.append(child.register_forward_hook(hook))
+            handles.append(child.register_forward_hook(forward_hook))
         except AttributeError:
             continue
+        if backward:
+
+            def backward_hook(
+                _child: Any,
+                _grad_input: Any,
+                grad_output: Any,
+                operation: str = f"{name}.backward",
+                origin: str = source,
+            ) -> None:
+                value = (
+                    grad_output[0]
+                    if isinstance(grad_output, tuple) and grad_output
+                    else grad_output
+                )
+                tracer.record(
+                    operation,
+                    value,
+                    source=origin,
+                    module=operation.rsplit(".", 1)[0],
+                    source_location=source_location,
+                    event_type="backward",
+                    phase="backward",
+                )
+
+            register = getattr(child, "register_full_backward_hook", None) or getattr(
+                child, "register_backward_hook", None
+            )
+            if callable(register):
+                try:
+                    handles.append(register(backward_hook))
+                except Exception:
+                    pass
     return handles
 
 
-def _tensor_trace_evidence(incident: Incident | RunCapsule) -> list[Any]:
+def persist_trace(
+    capsule: RunCapsule, tracer: TensorTracer, *, output: str | Any | None = None
+) -> dict[str, Any]:
+    """Attach trace analysis to capsule evidence and return the report."""
+    report = tracer.analyze()
+    report["missing_history"] = bool(report.get("missing_parents") or report.get("dropped_events"))
+    evidence = dict(capsule.evidence)
+    evidence["tensor_trace"] = {**tracer.to_dict(), "report": report}
+    object.__setattr__(capsule, "evidence", evidence)
+    if output is not None:
+        capsule.save(output, overwrite=True)
+    return report
+
+
+def auto_trace_module(
+    module: Any, *, max_events: int = 2_048, backward: bool = False
+) -> tuple[TensorTracer, list[Any]]:
+    tracer = TensorTracer(max_events=max_events)
+    handles = attach_torch_hooks(module, tracer, backward=backward)
+    return tracer, handles
+
+
+def _tensor_trace_evidence(incident: Incident | RunCapsule) -> tuple[list[Any], Mapping[str, Any]]:
     """Return recorded tensor-trace events, if the capsule carries any."""
     evidence = getattr(incident, "evidence", None)
     if not isinstance(evidence, Mapping):
-        return []
+        return ([], {})
     recorded = evidence.get("tensor_trace", ())
     if isinstance(recorded, Mapping):
-        recorded = recorded.get("events", ())
-    return list(recorded) if isinstance(recorded, (list, tuple)) else []
+        return (
+            list(recorded.get("events", ()))
+            if isinstance(recorded.get("events", ()), (list, tuple))
+            else [],
+            recorded,
+        )
+    return (list(recorded) if isinstance(recorded, (list, tuple)) else [], {})
 
 
 def _event_identity(event: Any) -> tuple[Any, ...]:
@@ -420,14 +566,27 @@ def _event_identity(event: Any) -> tuple[Any, ...]:
 def trace_incident(
     incident: Incident | RunCapsule,
     events: Iterable[TraceEvent] | TraceBuffer | None = None,
+    *,
+    radius: int = 8,
 ) -> dict[str, Any]:
+    if radius < 0:
+        raise ValueError("radius must be non-negative")
+    trace_metadata: Mapping[str, Any] = {}
     if events is None and isinstance(incident, RunCapsule):
         # Tensor-trace evidence and run events are complementary: a run normally
         # records coarse markers *and* detailed tensor provenance, so both have to
         # be considered or the recorded provenance becomes unreachable. The traced
         # sequence is kept contiguous so a window around an anomaly shows the
         # neighbouring operations rather than unrelated run markers.
-        merged = list(_tensor_trace_evidence(incident))
+        merged, trace_metadata = _tensor_trace_evidence(incident)
+        recorded_first = trace_metadata.get("first_abnormal")
+        if isinstance(recorded_first, Mapping):
+            first_identity = _event_identity(recorded_first)
+            if first_identity not in {_event_identity(item) for item in merged}:
+                # TraceBuffer keeps the first abnormal anchor separately from
+                # the ring. Re-introduce it for causal analysis after a
+                # capsule round trip, while retaining the truncation marker.
+                merged.insert(0, recorded_first)
         seen = {_event_identity(item) for item in merged}
         for item in incident.run.events:
             identity = _event_identity(item)
@@ -437,7 +596,21 @@ def trace_incident(
         events = merged
     if events is None:
         events = ()
-    records = events.events() if isinstance(events, TraceBuffer) else list(events)
+    if isinstance(events, TraceBuffer):
+        retained = events.events()
+        anchor = events.first_abnormal()
+        trace_metadata = {
+            "max_events": events.max_events,
+            "dropped_events": events.dropped_events,
+            "first_abnormal": anchor.to_dict() if anchor is not None else None,
+        }
+        records = list(retained)
+        if anchor is not None and _event_identity(anchor) not in {
+            _event_identity(item) for item in records
+        }:
+            records.insert(0, anchor)
+    else:
+        records = list(events)
     records = [
         item
         if isinstance(item, TraceEvent)
@@ -452,23 +625,38 @@ def trace_incident(
         )
         for item in records
     ]
-    first = next((event for event in records if _is_abnormal(event)), None)
     try:
         incident.traces = records  # type: ignore[attr-defined]
     except (AttributeError, TypeError):
         pass
-    analysis_buffer = TraceBuffer(max(1, len(records)))
+    configured_capacity = trace_metadata.get("max_events")
+    capacity = (
+        int(configured_capacity)
+        if isinstance(configured_capacity, int) and configured_capacity > 0
+        else max(1, len(records))
+    )
+    analysis_buffer = TraceBuffer(capacity)
     for item in records:
         analysis_buffer.record(item)
-    analysis = analysis_buffer.analyze()
+    recorded_drops = trace_metadata.get("dropped_events", 0)
+    if isinstance(recorded_drops, int) and recorded_drops > 0:
+        # The source ring may have evicted more history than the merged run
+        # markers did; retain the larger, already-bounded count.
+        analysis_buffer._dropped = max(analysis_buffer._dropped, recorded_drops)
+    analysis = analysis_buffer.analyze(radius=radius)
     return {
-        "first_abnormal": first.to_dict() if first else None,
+        "first_abnormal": analysis["first_abnormal"],
         "events": [event.to_dict() for event in records],
         "incident_id": getattr(incident, "incident_id", None),
         "run_id": incident.run.run_id if isinstance(incident, RunCapsule) else incident.run_id,
         "causal_path": analysis["causal_path"],
         "root_candidates": analysis["root_candidates"],
         "missing_parents": analysis["missing_parents"],
+        "missing_parent_explanations": analysis["missing_parent_explanations"],
+        "causal_window": analysis["causal_window"],
+        "window_radius": radius,
+        "dropped_events": analysis["dropped_events"],
+        "bounded": True,
     }
 
 

@@ -12,6 +12,21 @@ from .analysis import compare_runs
 from .core import Comparison, EvidenceState, Run, RunCapsule
 
 
+def _json_safe(value: Any) -> Any:
+    """Make adapter and user-supplied CI details safe for strict JSON."""
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float):
+        import math
+
+        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    return str(value)
+
+
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
@@ -68,6 +83,7 @@ def _built_in_checks(
 
     quality = _mapping(evidence.get("_data_quality"))
     nonfinite: dict[str, int] = {}
+    baseline_nonfinite: dict[str, int] = {}
     missing: list[str] = []
     insufficient: list[str] = []
     required_missing: list[str] = []
@@ -81,6 +97,12 @@ def _built_in_checks(
                 count = 0
             if count:
                 nonfinite[f"{category}:{name}"] = count
+            try:
+                baseline_count = int(details.get("baseline_nonfinite", 0) or 0)
+            except (TypeError, ValueError):
+                baseline_count = 0
+            if baseline_count:
+                baseline_nonfinite[f"{category}:{name}"] = baseline_count
             if details.get("candidate_missing"):
                 missing.append(f"{category}:{name}")
             if details.get("required") and not details.get("candidate_observations", 0):
@@ -103,6 +125,16 @@ def _built_in_checks(
                 {"nonfinite": nonfinite},
             )
         )
+        if baseline_nonfinite:
+            baseline_status = "fail" if fail_on_nonfinite else "warn"
+            checks.append(
+                CICheck(
+                    "no non-finite baseline observations",
+                    baseline_status != "fail",
+                    baseline_status,
+                    {"nonfinite": baseline_nonfinite},
+                )
+            )
         missing_status = (
             "fail"
             if (missing or required_missing) and fail_on_missing_evidence
@@ -137,10 +169,14 @@ def _built_in_checks(
     requirements = _mapping(evidence.get("_requirements"))
     required_evidence = [str(item) for item in requirements.get("required_evidence", ())]
     available = set(evidence)
+    per_member_missing = _mapping(requirements.get("missing_evidence"))
     missing_required_evidence = [
         item
         for item in required_evidence
-        if not ({item, item.lstrip("_"), f"_{item.lstrip('_')}"} & available)
+        if (
+            not ({item, item.lstrip("_"), f"_{item.lstrip('_')}"} & available)
+            or bool(per_member_missing.get(item))
+        )
     ]
     if required_evidence:
         evidence_status = (
@@ -156,6 +192,11 @@ def _built_in_checks(
                 {
                     "required": required_evidence,
                     "missing": missing_required_evidence,
+                    "missing_run_ids": {
+                        item: list(per_member_missing.get(item, ()))
+                        for item in missing_required_evidence
+                        if per_member_missing.get(item)
+                    },
                 },
             )
         )
@@ -247,7 +288,7 @@ class CICheck:
         if status == "pass" and not self.passed:
             raise ValueError("a passing CI check must be marked passed")
         object.__setattr__(self, "status", status)
-        object.__setattr__(self, "details", dict(self.details))
+        object.__setattr__(self, "details", _json_safe(self.details))
         if self.check_id is None:
             normalized = re.sub(r"[^a-z0-9]+", "_", self.name.casefold()).strip("_")
             object.__setattr__(self, "check_id", normalized or "check")
@@ -294,11 +335,13 @@ class CIResult:
             "exit_code": self.exit_code,
             "checks": [check.to_dict() for check in self.checks],
             "comparison": self.comparison.to_dict() if self.comparison else None,
-            "metadata": dict(self.metadata),
+            "metadata": _json_safe(self.metadata),
         }
 
     def to_json(self, *, indent: int | None = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=True, default=str)
+        return json.dumps(
+            self.to_dict(), indent=indent, sort_keys=True, allow_nan=False, default=str
+        )
 
     def summary(self) -> str:
         status = "PASS" if self.passed else "FAIL"

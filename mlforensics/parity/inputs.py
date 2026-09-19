@@ -7,6 +7,7 @@ import math
 import random
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,172 @@ try:  # NumPy is useful, but is not a required parity dependency.
     import numpy as _np
 except ImportError:  # pragma: no cover - exercised in minimal installations
     _np = None
+
+
+_SUPPORTED_DTYPES = frozenset(
+    {
+        "bool",
+        "bfloat16",
+        "float16",
+        "float32",
+        "float64",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "complex64",
+        "complex128",
+    }
+)
+_SUPPORTED_DISTRIBUTIONS = frozenset(
+    {
+        "uniform",
+        "flat",
+        "normal",
+        "gaussian",
+        "log-normal",
+        "lognormal",
+        "zeros",
+        "zero",
+        "ones",
+        "one",
+    }
+)
+_SPEC_FIELDS = frozenset(
+    {
+        "name",
+        "dtype",
+        "shape",
+        "dynamic_dims",
+        "dynamic",
+        "value_range",
+        "range",
+        "distribution",
+        "semantic_constraints",
+        "constraints",
+        "metadata",
+        "value",
+    }
+)
+
+
+def _canonical_dtype_name(dtype: Any) -> str:
+    """Return a portable dtype name, including aliases used by model runtimes."""
+
+    if dtype is float:
+        normalized = "float64"
+    elif dtype is int:
+        normalized = "int32"
+    elif dtype is bool:
+        normalized = "bool"
+    elif isinstance(dtype, str):
+        normalized = dtype.strip().casefold().replace(" ", "")
+        normalized = normalized.removeprefix("numpy.").removeprefix("np.")
+        normalized = normalized.removeprefix("torch.")
+    elif _np is not None:
+        try:
+            normalized = str(_np.dtype(dtype)).casefold()
+        except (TypeError, ValueError):
+            normalized = str(dtype).strip().casefold().replace("torch.", "")
+    else:
+        normalized = str(dtype).strip().casefold().replace("torch.", "")
+    aliases = {
+        "float": "float32",
+        "single": "float32",
+        "fp32": "float32",
+        "double": "float64",
+        "half": "float16",
+        "fp16": "float16",
+        "bf16": "bfloat16",
+        "bfloat": "bfloat16",
+        "long": "int64",
+        "int": "int32",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _is_spec_mapping(value: Mapping[str, Any]) -> bool:
+    return bool(set(value).intersection(_SPEC_FIELDS))
+
+
+def _canonical_distribution_name(distribution: Any) -> str:
+    if not isinstance(distribution, str) or not distribution.strip():
+        raise ValueError("distribution must be a non-empty string")
+    normalized = distribution.strip().casefold().replace("_", "-")
+    if normalized not in _SUPPORTED_DISTRIBUTIONS:
+        raise ValueError(f"unsupported input distribution: {distribution}")
+    return normalized
+
+
+def _normalize_shape_dimension(item: Any) -> int | str | None:
+    if item is None:
+        return None
+    if isinstance(item, str):
+        stripped = item.strip()
+        if not stripped:
+            raise ValueError("input spec dimensions cannot be empty")
+        try:
+            return int(stripped)
+        except ValueError:
+            return stripped
+    if isinstance(item, bool) or not isinstance(item, Integral):
+        raise ValueError("input spec dimensions must be integers, names, or null")
+    return int(item)
+
+
+def _named_specs(spec_class: type[InputSpec], values: Mapping[Any, Any]) -> dict[str, InputSpec]:
+    """Parse ``{"input-name": spec}`` without silently changing names."""
+
+    result: dict[str, InputSpec] = {}
+    for raw_name, raw_spec in values.items():
+        name = str(raw_name).strip()
+        if not name:
+            raise ValueError("named input specifications require non-empty names")
+        if isinstance(raw_spec, spec_class):
+            spec = raw_spec
+            if spec.name != name:
+                raise ValueError(f"input specification name {spec.name!r} does not match {name!r}")
+        elif isinstance(raw_spec, Mapping):
+            spec_data = dict(raw_spec)
+            declared_name = spec_data.get("name", name)
+            if declared_name != name:
+                raise ValueError(
+                    f"input specification name {declared_name!r} does not match {name!r}"
+                )
+            spec_data["name"] = name
+            spec = spec_class.from_dict(spec_data)
+        else:
+            spec = spec_class(name=name, metadata={"value": raw_spec})
+        if name in result:
+            raise ValueError(f"duplicate input specification name: {name!r}")
+        result[name] = spec
+    if not result:
+        raise ValueError("input specification must define at least one input")
+    return result
+
+
+def _sequence_specs(spec_class: type[InputSpec], values: Sequence[Any]) -> dict[str, InputSpec]:
+    result: dict[str, InputSpec] = {}
+    for index, raw_spec in enumerate(values):
+        default_name = f"input-{index}"
+        if isinstance(raw_spec, spec_class):
+            spec = raw_spec
+        elif isinstance(raw_spec, Mapping):
+            spec_data = dict(raw_spec)
+            spec_data.setdefault("name", default_name)
+            spec = spec_class.from_dict(spec_data)
+        else:
+            spec = spec_class(name=default_name, metadata={"value": raw_spec})
+        if spec.name in result:
+            raise ValueError(f"duplicate input specification name: {spec.name!r}")
+        result[spec.name] = spec
+    if not result:
+        raise ValueError("input specification must define at least one input")
+    return result
 
 
 @dataclass(frozen=True)
@@ -32,43 +199,102 @@ class InputSpec:
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("input spec name must be a non-empty string")
+        object.__setattr__(self, "name", self.name.strip())
         if self.shape is not None:
-            raw_shape = (self.shape,) if isinstance(self.shape, int) else self.shape
-            shape = tuple(
-                None if item is None else str(item) if isinstance(item, str) else int(item)
-                for item in raw_shape
-            )
-            if any(
-                isinstance(item, int) and item < 0 or isinstance(item, str) and not item.strip()
-                for item in shape
-            ):
+            if isinstance(self.shape, str):
+                parts = self.shape.split(",")
+                if not self.shape.strip() or any(not part.strip() for part in parts):
+                    raise ValueError("input spec shape must contain non-empty dimensions")
+                raw_shape = tuple(part.strip() for part in parts)
+            else:
+                if isinstance(self.shape, (str, bytes)):
+                    raise ValueError("input spec shape must be a sequence of dimensions")
+                raw_shape = (self.shape,) if isinstance(self.shape, Integral) else self.shape
+                try:
+                    raw_shape = tuple(raw_shape)
+                except TypeError as exc:
+                    raise ValueError("input spec shape must be a sequence of dimensions") from exc
+            shape = tuple(_normalize_shape_dimension(item) for item in raw_shape)
+            if any(isinstance(item, int) and item < 0 for item in shape):
                 raise ValueError("input spec dimensions cannot be negative")
             object.__setattr__(self, "shape", shape)
+        normalized_dtype = _canonical_dtype_name(self.dtype)
+        if normalized_dtype not in _SUPPORTED_DTYPES:
+            raise ValueError(f"unsupported input dtype: {self.dtype}")
+        object.__setattr__(self, "dtype", normalized_dtype)
         dynamic: dict[int | str, tuple[int, ...]] = {}
-        for key, values in dict(self.dynamic_dims).items():
-            raw_values = (values,) if isinstance(values, int) else values
-            normalized = tuple(int(value) for value in raw_values)
-            if not normalized or any(value < 0 for value in normalized):
+        if self.dynamic_dims is None:
+            raw_dynamic_dims: Mapping[Any, Any] = {}
+        elif isinstance(self.dynamic_dims, Mapping):
+            raw_dynamic_dims = self.dynamic_dims
+        else:
+            raise ValueError("dynamic_dims must be a mapping")
+        if self.shape is None and raw_dynamic_dims:
+            raise ValueError("dynamic_dims require an input shape")
+        for key, values in raw_dynamic_dims.items():
+            if isinstance(key, bool) or not isinstance(key, (Integral, str)):
+                raise ValueError("dynamic dimension keys must be indices or names")
+            if isinstance(key, str):
+                key = key.strip()
+                if not key:
+                    raise ValueError("dynamic dimension names cannot be empty")
+            else:
+                key = int(key)
+            if key in dynamic:
+                raise ValueError(f"duplicate dynamic dimension key: {key!r}")
+            if isinstance(values, (str, bytes)) or values is None:
+                raw_values = (values,) if isinstance(values, Integral) else None
+            elif isinstance(values, Integral):
+                raw_values = (values,)
+            else:
+                try:
+                    raw_values = tuple(values)
+                except TypeError:
+                    raw_values = None
+            if not raw_values:
+                raise ValueError("dynamic dimension choices must be a non-empty sequence")
+            normalized_values: list[int] = []
+            for value in raw_values:
+                if isinstance(value, bool) or not isinstance(value, Integral):
+                    raise ValueError("dynamic dimension choices must be integers")
+                normalized_values.append(int(value))
+            if any(value < 0 for value in normalized_values):
                 raise ValueError("dynamic dimension choices must be non-negative")
-            dynamic[key] = normalized
+            dynamic[key] = tuple(normalized_values)
         object.__setattr__(self, "dynamic_dims", dynamic)
+        if self.shape is not None:
+            dimension_names = {item for item in self.shape if isinstance(item, str)}
+            for key in dynamic:
+                if isinstance(key, int) and key >= len(self.shape):
+                    raise ValueError(f"dynamic dimension index {key} is outside the input shape")
+                if isinstance(key, str) and key not in dimension_names:
+                    raise ValueError(f"dynamic dimension {key!r} is not present in the input shape")
         if self.value_range is not None:
             try:
                 raw_range = tuple(self.value_range)
-            except TypeError as exc:
+            except (TypeError, ValueError) as exc:
                 raise ValueError("value_range must be an ordered pair") from exc
             if len(raw_range) != 2 or float(raw_range[0]) > float(raw_range[1]):
                 raise ValueError("value_range must be an ordered pair")
             if not all(_finite_number(item) for item in raw_range):
                 raise ValueError("value_range must contain finite numbers")
             object.__setattr__(self, "value_range", (float(raw_range[0]), float(raw_range[1])))
-        if not isinstance(self.distribution, str) or not self.distribution.strip():
-            raise ValueError("distribution must be a non-empty string")
+        object.__setattr__(self, "distribution", _canonical_distribution_name(self.distribution))
         constraints = (
             (self.semantic_constraints,)
             if isinstance(self.semantic_constraints, str)
             else self.semantic_constraints
         )
+        if constraints is None or isinstance(constraints, (bytes, Mapping)):
+            raise ValueError("semantic_constraints must be a string or sequence of strings")
+        try:
+            constraints = tuple(constraints)
+        except TypeError as exc:
+            raise ValueError(
+                "semantic_constraints must be a string or sequence of strings"
+            ) from exc
+        if any(not isinstance(item, str) or not item.strip() for item in constraints):
+            raise ValueError("semantic_constraints must contain non-empty strings")
         object.__setattr__(self, "semantic_constraints", tuple(str(item) for item in constraints))
         if not isinstance(self.metadata, Mapping):
             raise ValueError("input spec metadata must be a mapping")
@@ -82,48 +308,77 @@ class InputSpec:
     def from_dict(cls, value: Mapping[str, Any]) -> InputSpec:
         if not isinstance(value, Mapping):
             raise TypeError("input spec must be a mapping")
+        unknown = set(value) - _SPEC_FIELDS
+        if unknown:
+            raise ValueError(f"unknown input specification fields: {sorted(unknown, key=str)}")
+        if "value_range" in value and "range" in value and value["value_range"] != value["range"]:
+            raise ValueError("input spec cannot define conflicting value_range and range")
+        if (
+            "dynamic_dims" in value
+            and "dynamic" in value
+            and value["dynamic_dims"] != value["dynamic"]
+        ):
+            raise ValueError("input spec cannot define conflicting dynamic_dims and dynamic")
+        if (
+            "semantic_constraints" in value
+            and "constraints" in value
+            and value["semantic_constraints"] != value["constraints"]
+        ):
+            raise ValueError("input spec cannot define conflicting semantic constraints")
         raw_range = value.get("value_range", value.get("range"))
+        metadata = value.get("metadata", {})
+        if "value" in value:
+            if metadata is None:
+                metadata = {}
+            if not isinstance(metadata, Mapping):
+                raise ValueError("input spec metadata must be a mapping")
+            metadata = {**metadata, "value": value["value"]}
         return cls(
-            name=str(value.get("name", "input")),
+            name=value.get("name", "input"),
             dtype=value.get("dtype", "float32"),
             shape=value.get("shape"),
             dynamic_dims=value.get("dynamic_dims", value.get("dynamic", {})) or {},
             value_range=tuple(raw_range) if raw_range is not None else None,
-            distribution=str(value.get("distribution", "uniform")),
+            distribution=value.get("distribution", "uniform"),
             semantic_constraints=value.get("semantic_constraints", value.get("constraints", ()))
             or (),
-            metadata=value.get("metadata", {}),
+            metadata=metadata,
         )
 
     @classmethod
-    def from_json(cls, value: str | Path | Mapping[str, Any]) -> InputSpec | dict[str, InputSpec]:
+    def from_json(
+        cls, value: str | Path | Mapping[str, Any] | Sequence[Any]
+    ) -> InputSpec | dict[str, InputSpec]:
+        if isinstance(value, cls):
+            return value
         if isinstance(value, Mapping):
-            if "inputs" in value and isinstance(value["inputs"], Mapping):
-                return {
-                    str(name): spec
-                    if isinstance(spec, cls)
-                    else cls.from_dict({"name": name, **dict(spec)})
-                    if isinstance(spec, Mapping)
-                    else cls(name=str(name), metadata={"value": spec})
-                    for name, spec in value["inputs"].items()
-                }
-            return cls.from_dict(value)
-        if isinstance(value, (list, tuple)):
-            return {
-                spec.name: spec
-                for index, item in enumerate(value)
-                for spec in [
-                    cls.from_dict({"name": f"input-{index}", **dict(item)})
-                    if isinstance(item, Mapping)
-                    else cls(name=f"input-{index}", metadata={"value": item})
-                ]
-            }
+            if "inputs" in value:
+                raw_inputs = value["inputs"]
+                if isinstance(raw_inputs, Mapping):
+                    return _named_specs(cls, raw_inputs)
+                if isinstance(raw_inputs, Sequence) and not isinstance(raw_inputs, (str, bytes)):
+                    return _sequence_specs(cls, raw_inputs)
+                raise TypeError("input spec 'inputs' must be a mapping or sequence")
+            if _is_spec_mapping(value):
+                return cls.from_dict(value)
+            return _named_specs(cls, value)
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, Path)):
+            return _sequence_specs(cls, value)
+        if not isinstance(value, (str, Path)):
+            raise TypeError("input spec JSON must be an object, array, path, or JSON string")
         raw_text = str(value)
         if raw_text.lstrip().startswith(("{", "[")):
-            raw = json.loads(raw_text)
+            try:
+                raw = json.loads(raw_text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid input spec JSON: {exc.msg}") from exc
         else:
             path = Path(raw_text)
-            raw = json.loads(path.read_text(encoding="utf-8") if path.exists() else raw_text)
+            try:
+                raw_text = path.read_text(encoding="utf-8") if path.exists() else raw_text
+                raw = json.loads(raw_text)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"invalid input spec JSON: {exc}") from exc
         return cls.from_json(raw)
 
     def resolve_shape(self, *, seed: int = 0) -> tuple[int, ...] | None:
@@ -182,38 +437,44 @@ class InputCase:
         }
 
 
-def _normal_shape(shape: int | Sequence[int] | None) -> tuple[int, ...] | None:
+def _normal_shape(shape: int | Sequence[int] | str | None) -> tuple[int, ...] | None:
     if shape is None:
         return None
-    if isinstance(shape, int):
+    if isinstance(shape, bool):
+        raise ValueError("shape dimensions must be integers")
+    if isinstance(shape, Integral):
         if shape < 0:
             raise ValueError("shape dimensions cannot be negative")
-        return (shape,)
-    normalized = tuple(int(size) for size in shape)
+        return (int(shape),)
+    if isinstance(shape, str):
+        parts = shape.split(",")
+        if not shape.strip() or any(not part.strip() for part in parts):
+            raise ValueError("shape must contain non-empty dimensions")
+        shape = parts
+    if isinstance(shape, (bytes, Mapping)):
+        raise ValueError("shape must be a sequence of dimensions")
+    try:
+        raw_shape = tuple(shape)
+    except TypeError as exc:
+        raise ValueError("shape must be a sequence of dimensions") from exc
+    normalized = tuple(_normalize_shape_dimension(size) for size in raw_shape)
+    if any(size is None or isinstance(size, str) for size in normalized):
+        raise ValueError("generated input shapes must contain concrete integer dimensions")
     if any(size < 0 for size in normalized):
         raise ValueError("shape dimensions cannot be negative")
-    return normalized
+    return tuple(int(size) for size in normalized)
 
 
 def _normalized_dtype(dtype: Any) -> Any:
-    if isinstance(dtype, str):
-        normalized = dtype.casefold().replace("numpy.", "").replace("torch.", "")
-        aliases = {
-            "float": "float32",
-            "double": "float64",
-            "half": "float16",
-            "bf16": "float32",
-            "long": "int64",
-            "int": "int32",
-        }
-        value = aliases.get(normalized, normalized)
-        if _np is not None:
-            try:
-                return _np.dtype(value)
-            except TypeError:
-                pass
+    value = _canonical_dtype_name(dtype)
+    if value not in _SUPPORTED_DTYPES:
+        raise ValueError(f"unsupported input dtype: {dtype}")
+    if _np is None:
         return value
-    return dtype
+    # NumPy still has no portable bfloat16 dtype.  Host values use float32,
+    # rounded to the BF16 mantissa below, while the InputSpec keeps the
+    # contract name for reports and adapters.
+    return _np.dtype("float32" if value == "bfloat16" else value)
 
 
 def _finite_number(value: Any) -> bool:
@@ -223,12 +484,58 @@ def _finite_number(value: Any) -> bool:
         return False
 
 
+def _bfloat16_round(array: Any) -> Any:
+    """Round float32 values to BF16 precision without requiring PyTorch."""
+
+    if _np is None:
+        return array
+    values = _np.asarray(array, dtype=_np.float32)
+    bits = values.view(_np.uint32)
+    # Round-to-nearest-even before dropping the low 16 mantissa bits.
+    rounding = _np.uint32(0x7FFF) + ((bits >> _np.uint32(16)) & _np.uint32(1))
+    return ((bits + rounding) & _np.uint32(0xFFFF0000)).view(_np.float32)
+
+
+def _cast_values(values: Any, dtype: Any, shape: tuple[int, ...] | None = None) -> Any:
+    """Cast generated values and apply the portable BF16 emulation."""
+
+    canonical = _canonical_dtype_name(dtype)
+    if canonical not in _SUPPORTED_DTYPES:
+        raise ValueError(f"unsupported input dtype: {dtype}")
+    if _np is None:
+        return values
+    host_dtype = _normalized_dtype(dtype)
+    try:
+        array = _np.asarray(values, dtype=host_dtype)
+        if canonical == "bfloat16":
+            array = _bfloat16_round(array)
+        if shape is not None:
+            array = array.reshape(shape)
+        return array
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"values cannot be represented by input dtype {canonical}") from exc
+
+
+def _supports_non_finite(dtype: Any) -> bool:
+    canonical = _canonical_dtype_name(dtype)
+    return (
+        canonical.startswith("float") or canonical.startswith("complex") or canonical == "bfloat16"
+    )
+
+
+def _validate_range(low: Any, high: Any) -> tuple[float, float]:
+    if not _finite_number(low) or not _finite_number(high):
+        raise ValueError("input value range must contain finite numbers")
+    normalized = (float(low), float(high))
+    if normalized[0] > normalized[1]:
+        raise ValueError("input value range must be ordered")
+    return normalized
+
+
 def _apply_constraints(value: Any, spec: InputSpec | None) -> Any:
     if spec is None:
         return value
     constraints = {item.casefold().replace("_", "-") for item in spec.semantic_constraints}
-    if not constraints:
-        return value
     if _np is not None:
         try:
             array = _np.asarray(value)
@@ -240,27 +547,23 @@ def _apply_constraints(value: Any, spec: InputSpec | None) -> Any:
                 array = _np.zeros_like(array)
                 if array.size:
                     array.flat[0] = 1
-            return array.astype(_normalized_dtype(spec.dtype), copy=False)
+            return _cast_values(array, spec.dtype)
         except (TypeError, ValueError, OverflowError):
-            pass
+            if constraints:
+                raise ValueError(f"value does not satisfy input dtype {spec.dtype}") from None
     return value
 
 
 def _make_value(value: Any, shape: tuple[int, ...] | None, dtype: Any = float) -> Any:
-    dtype = _normalized_dtype(dtype)
+    _normalized_dtype(dtype)
     if shape is None:
-        return value
+        return _cast_values(value, dtype) if _np is not None else value
     size = 1
     for dim in shape:
         size *= dim
     values = [value] * size
     if _np is not None:
-        try:
-            return _np.asarray(values, dtype=dtype).reshape(shape)
-        except (TypeError, ValueError, OverflowError):
-            # Integer dtypes cannot represent +/-inf or nan.  Preserve the
-            # edge case as a float array instead of making generation fail.
-            return _np.asarray(values, dtype=float).reshape(shape)
+        return _cast_values(values, dtype, shape)
     if len(shape) == 1:
         return values
 
@@ -283,8 +586,8 @@ def _random_value(
     dtype: Any = float,
     distribution: str = "uniform",
 ) -> Any:
-    dtype = _normalized_dtype(dtype)
-    distribution_name = str(distribution).casefold().replace("_", "-")
+    _normalized_dtype(dtype)
+    distribution_name = _canonical_distribution_name(distribution)
 
     def draw() -> float:
         if distribution_name in {"uniform", "flat"}:
@@ -306,13 +609,13 @@ def _random_value(
         raise ValueError(f"unsupported input distribution: {distribution}")
 
     if shape is None:
-        return draw()
+        return _cast_values(draw(), dtype) if _np is not None else draw()
     size = 1
     for dim in shape:
         size *= dim
     values = [draw() for _ in range(size)]
     if _np is not None:
-        return _np.asarray(values, dtype=dtype).reshape(shape)
+        return _cast_values(values, dtype, shape)
     return values
 
 
@@ -339,8 +642,23 @@ def _dedupe(values: Iterable[Any]) -> list[Any]:
 
 def _same_value(left: Any, right: Any) -> bool:
     try:
+        if isinstance(left, Mapping) or isinstance(right, Mapping):
+            if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+                return False
+            return left.keys() == right.keys() and all(
+                _same_value(left[key], right[key]) for key in left
+            )
         if _np is not None and (isinstance(left, _np.ndarray) or isinstance(right, _np.ndarray)):
             return bool(_np.array_equal(left, right, equal_nan=True))
+        if (
+            isinstance(left, Sequence)
+            and not isinstance(left, (str, bytes))
+            or isinstance(right, Sequence)
+            and not isinstance(right, (str, bytes))
+        ):
+            if not isinstance(left, Sequence) or not isinstance(right, Sequence):
+                return False
+            return len(left) == len(right) and all(_same_value(a, b) for a, b in zip(left, right))
         result = left == right
         if isinstance(result, bool):
             return result
@@ -351,7 +669,7 @@ def _same_value(left: Any, right: Any) -> bool:
 
 def generate_representative_inputs(
     shape: int | Sequence[int] | None = None,
-    dtype: Any = float,
+    dtype: Any = "float32",
     count: int = 8,
     seed: int = 0,
     low: float = -1.0,
@@ -362,6 +680,8 @@ def generate_representative_inputs(
 
     if count < 0:
         raise ValueError("count must be non-negative")
+    low, high = _validate_range(low, high)
+    distribution = _canonical_distribution_name(distribution)
     normalized = _normal_shape(shape)
     constants = [
         _make_value(0, normalized, dtype),
@@ -381,7 +701,7 @@ def generate_representative_inputs(
 
 def generate_edge_inputs(
     shape: int | Sequence[int] | None = None,
-    dtype: Any = float,
+    dtype: Any = "float32",
     include_non_finite: bool = False,
     count: int | None = None,
     seed: int = 0,
@@ -394,6 +714,8 @@ def generate_edge_inputs(
     Non-finite values are opt-in because many production models reject them.
     """
 
+    low, high = _validate_range(low, high)
+    distribution = _canonical_distribution_name(distribution)
     normalized = _normal_shape(shape)
     values: list[Any] = [
         _make_value(1e-12, normalized, dtype),
@@ -403,7 +725,7 @@ def generate_edge_inputs(
     ]
     if normalized and normalized[0] == 0:
         values.insert(0, _make_value(0, normalized, dtype))
-    if include_non_finite:
+    if include_non_finite and _supports_non_finite(dtype):
         values.extend(
             [
                 _make_value(float("inf"), normalized, dtype),
@@ -426,26 +748,27 @@ def generate_edge_inputs(
 
 def generate_adversarial_inputs(
     shape: int | Sequence[int] | None = None,
-    dtype: Any = float,
+    dtype: Any = "float32",
     seed: int = 0,
     include_non_finite: bool = True,
     distribution: str = "uniform",
 ) -> list[Any]:
     """Generate inputs likely to expose backend numerical or shape drift."""
 
+    distribution = _canonical_distribution_name(distribution)
     normalized = _normal_shape(shape)
     edges = generate_edge_inputs(
         shape=normalized, dtype=dtype, include_non_finite=include_non_finite
     )
     if normalized is None:
-        alternating: Any = -1.0
+        alternating: Any = _make_value(-1.0, None, dtype)
     else:
         size = 1
         for dim in normalized:
             size *= dim
         values = [1.0 if index % 2 == 0 else -1.0 for index in range(size)]
         if _np is not None:
-            alternating = _np.asarray(values, dtype=dtype).reshape(normalized)
+            alternating = _cast_values(values, dtype, normalized)
         else:
             alternating = values
     rng = random.Random(seed)
@@ -457,7 +780,7 @@ def generate_input_cases(
     *,
     examples: Iterable[Any] | None = None,
     shape: int | Sequence[int] | None = None,
-    dtype: Any = float,
+    dtype: Any = "float32",
     seed: int = 0,
     representative_count: int = 8,
     include_adversarial: bool = True,
@@ -471,6 +794,8 @@ def generate_input_cases(
     """Build labeled cases suitable for a parity report."""
 
     cases: list[InputCase] = []
+    if isinstance(examples, Mapping):
+        examples = [examples]
     if examples is not None:
         cases.extend(
             InputCase(value, f"example-{i}", "example", identity=f"example:{i}")
@@ -496,37 +821,35 @@ def generate_input_cases(
     if input_spec is not None:
         if isinstance(input_spec, InputSpec):
             normalized_specs[input_spec.name] = input_spec
+        elif isinstance(input_spec, (str, Path)):
+            parsed = InputSpec.from_json(input_spec)
+            if isinstance(parsed, InputSpec):
+                normalized_specs[parsed.name] = parsed
+            else:
+                normalized_specs.update(parsed)
         elif isinstance(input_spec, Mapping):
-            if "inputs" in input_spec and isinstance(input_spec["inputs"], Mapping):
-                named_specs = input_spec["inputs"]
-                for name, raw in named_specs.items():
-                    spec = (
-                        raw
-                        if isinstance(raw, InputSpec)
-                        else InputSpec.from_dict({"name": name, **dict(raw)})
-                        if isinstance(raw, Mapping)
-                        else InputSpec(name=str(name), metadata={"value": raw})
-                    )
-                    normalized_specs[str(name)] = spec
-            elif any(key in input_spec for key in ("shape", "dtype", "name", "dynamic_dims")):
+            if "inputs" in input_spec:
+                parsed = InputSpec.from_json(input_spec)
+                if isinstance(parsed, InputSpec):
+                    normalized_specs[parsed.name] = parsed
+                else:
+                    normalized_specs.update(parsed)
+            elif _is_spec_mapping(input_spec):
                 spec = InputSpec.from_dict(input_spec)
                 normalized_specs[spec.name] = spec
             else:
-                for name, raw in input_spec.items():
-                    spec = (
-                        raw
-                        if isinstance(raw, InputSpec)
-                        else InputSpec.from_dict({"name": name, **dict(raw)})
-                    )
-                    normalized_specs[str(name)] = spec
+                normalized_specs.update(_named_specs(InputSpec, input_spec))
         else:
-            raise TypeError("input_spec must be an InputSpec or mapping")
+            raise TypeError("input_spec must be an InputSpec, mapping, JSON string, or path")
 
     def generated_for_spec(spec: InputSpec | None, category: str) -> list[Any]:
         local_shape = spec.resolve_shape(seed=seed) if spec is not None else shape
         local_dtype = spec.dtype if spec is not None else dtype
         if spec is not None and "value" in spec.metadata:
-            return [_apply_constraints(spec.metadata["value"], spec)]
+            value = _apply_constraints(spec.metadata["value"], spec)
+            if spec.shape is not None and not isinstance(value, Mapping):
+                value = _cast_values(value, spec.dtype, local_shape)
+            return [value]
         low, high = (
             spec.value_range if spec is not None and spec.value_range is not None else (-1.0, 1.0)
         )

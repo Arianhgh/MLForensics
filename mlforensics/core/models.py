@@ -61,7 +61,12 @@ def _record(value: Any) -> Any:
     if hasattr(value, "to_dict"):
         return value.to_dict()
     if isinstance(value, Mapping):
-        return {str(k): _record(v) for k, v in value.items()}
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("record mappings must use string keys")
+            result[key] = _record(item)
+        return result
     if isinstance(value, (tuple, list)):
         return [_record(item) for item in value]
     return value
@@ -343,10 +348,12 @@ class ArtifactRef:
         _str(self.name, "name")
         if not isinstance(self.uri, str):
             raise ValidationError("uri must be a string")
-        if self.sha256 and not _HEX64.fullmatch(self.sha256):
+        if self.sha256 and (not isinstance(self.sha256, str) or not _HEX64.fullmatch(self.sha256)):
             raise ValidationError("sha256 must be a lowercase 64-character hex digest")
         if self.size_bytes is not None and (
-            not isinstance(self.size_bytes, int) or self.size_bytes < 0
+            isinstance(self.size_bytes, bool)
+            or not isinstance(self.size_bytes, int)
+            or self.size_bytes < 0
         ):
             raise ValidationError("size_bytes must be a non-negative integer or None")
         if self.media_type is not None:
@@ -1328,10 +1335,6 @@ class FailureSignature:
                 (self.phase is None or self.phase == candidate.phase)
                 and (self.module is None or self.module == candidate.module)
                 and (self.operation is None or self.operation == candidate.operation)
-                and (
-                    self.top_frame is None
-                    or frame_key(self.top_frame) == frame_key(candidate.top_frame)
-                )
             )
 
         if self.kind == "exception":

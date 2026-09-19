@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mlforensics.dev/schema/mlcap-1.manifest.schema.json",
+  "title": "MLForensics mlcap-1 manifest",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "format", "producer", "files", "sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "format": {"const": "mlcap-1"},
+    "producer": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {"name": {"type": "string"}, "version": {"type": "string"}},
+      "additionalProperties": true
+    },
+    "files": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "sha256": {
+      "type": "object",
+      "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    },
+    "features": {"type": "object"},
+    "required_reader_capabilities": {"type": "array", "items": {"type": "string"}},
+    "minimum_reader_version": {"type": "string"},
+    "provenance": {"type": "object"},
+    "signature": {"$ref": "#/$defs/signature"}
+  },
+  "$defs": {
+    "signature": {
+      "type": "object",
+      "required": ["algorithm", "encoding", "value"],
+      "properties": {
+        "algorithm": {"type": "string", "minLength": 1},
+        "encoding": {"type": "string", "minLength": 1},
+        "value": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": true
+    }
+  }
+}

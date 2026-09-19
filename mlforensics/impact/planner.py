@@ -162,6 +162,66 @@ class ImpactPlanner:
     def _roots(self, changed: Iterable[str | Node | DiffChange]) -> set[str]:
         roots: set[str] = set()
 
+        def normalized_path(value: str) -> str:
+            return value.replace("\\", "/").lstrip("./")
+
+        def module_aliases(value: str) -> tuple[str, ...]:
+            path = normalized_path(value)
+            if not path.endswith(".py"):
+                return ()
+            module = path[:-3].replace("/", ".")
+            if module.endswith(".__init__"):
+                module = module[:-9]
+            return tuple(
+                dict.fromkeys(
+                    (
+                        f"module:{path}",
+                        f"module:{module}",
+                    )
+                )
+            )
+
+        def add_unknown_change(value: str) -> str:
+            path = normalized_path(value)
+            kind = (
+                "notebook"
+                if path.endswith(".ipynb")
+                else "configuration"
+                if path.endswith((".toml", ".yaml", ".yml", ".json", ".ini", ".cfg"))
+                else "data"
+                if path.endswith((".csv", ".parquet", ".sql", ".dvc"))
+                else "generated"
+                if path.endswith((".lock", ".generated"))
+                else "unknown"
+            )
+            node_id = f"unknown:change:{path}"
+            self.graph.add_node(
+                Node(
+                    node_id,
+                    "unknown",
+                    path,
+                    path,
+                    {"change_kind": kind, "conservative": True},
+                )
+            )
+            # Runtime/configuration/data changes can affect code that is not
+            # statically connected.  Preserve that uncertainty explicitly so
+            # the planner cannot report an unjustified empty impact set.
+            for node in list(self.graph):
+                if node.id == node_id or node.kind == "unknown":
+                    continue
+                if node.kind in {"file", "module", "dataset", "feature", "model"}:
+                    self.graph.add_edge(
+                        node.id,
+                        node_id,
+                        "conservative",
+                        {
+                            "confidence": "low",
+                            "explanation": f"possible dependency on changed {kind} {path}",
+                        },
+                    )
+            return node_id
+
         def add_root(value: str) -> None:
             if value not in self.graph.nodes:
                 return
@@ -186,8 +246,56 @@ class ImpactPlanner:
 
         for item in changed:
             if isinstance(item, DiffChange):
-                for node_id in GitDiffImpactExtractor.changed_node_ids([item], self.graph):
+                matched_node_ids = GitDiffImpactExtractor.changed_node_ids([item], self.graph)
+                for node_id in matched_node_ids:
                     add_root(node_id)
+                all_paths = [item.path, *([item.old_path] if item.old_path else [])]
+                for path in all_paths:
+                    missing_source = item.is_deleted or (
+                        item.old_path == path and item.status.upper().startswith(("R", "C"))
+                    )
+                    aliases = tuple(
+                        alias for alias in module_aliases(path) if alias in self.graph.nodes
+                    )
+                    if aliases:
+                        roots.update(aliases)
+                    elif path.endswith(".py") and missing_source:
+                        # Deleted files are absent from the current tree, but
+                        # unresolved imports still use dotted module IDs.
+                        for alias in module_aliases(path):
+                            self.graph.add_node(
+                                Node(
+                                    alias,
+                                    "module",
+                                    alias.removeprefix("module:"),
+                                    normalized_path(path),
+                                    {"deleted_or_renamed": True, "conservative": True},
+                                )
+                            )
+                            roots.add(alias)
+                    elif not matched_node_ids:
+                        roots.add(add_unknown_change(path))
+                    if path.endswith(".py") and missing_source:
+                        module_name = normalized_path(path)[:-3].replace("/", ".")
+                        if module_name.endswith(".__init__"):
+                            module_name = module_name[:-9]
+                        unresolved_id = f"unknown:module:{module_name}"
+                        self.graph.add_node(
+                            Node(
+                                unresolved_id,
+                                "unknown",
+                                module_name,
+                                normalized_path(path),
+                                {"deleted_or_renamed": True, "conservative": True},
+                            )
+                        )
+                        roots.add(unresolved_id)
+                        roots.update(
+                            node.id
+                            for node in self.graph
+                            if node.id.startswith(f"{module_name}:")
+                            or node.id.startswith(f"module:{module_name}:")
+                        )
                 continue
             value = item.id if isinstance(item, Node) else str(item)
             if value in self.graph.nodes:
@@ -207,6 +315,8 @@ class ImpactPlanner:
                     matched = True
             if not matched and value.startswith("module:"):
                 roots.add(value)
+            elif not matched:
+                roots.add(add_unknown_change(value))
         return roots
 
     def plan(
@@ -231,7 +341,14 @@ class ImpactPlanner:
     def report(self, changed_files: Iterable[str | DiffChange]) -> ImpactReport:
         changes = list(changed_files)
         paths = sorted(
-            {item.path if isinstance(item, DiffChange) else str(item) for item in changes}
+            {
+                path
+                for item in changes
+                for path in (
+                    (item.path, item.old_path) if isinstance(item, DiffChange) else (str(item),)
+                )
+                if path
+            }
         )
         roots = self._roots(changes)
         plan = self.plan(changes)

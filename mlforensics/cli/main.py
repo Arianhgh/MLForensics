@@ -13,6 +13,7 @@ import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
 
 from ..analysis import compare_runs, render_comparison
 from ..capture import (
@@ -61,6 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     run = sub.add_parser("run", help="capture an external command")
+    run.add_argument("--config", default=argparse.SUPPRESS, help="path to mlforensics.toml")
     run.add_argument("--output", default=None, help="capsule directory or archive path")
     run.add_argument("--repo", default=".")
     run.add_argument("--json", action="store_true", dest="as_json")
@@ -82,6 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("run_command", nargs=argparse.REMAINDER, help="command to execute")
 
     compare = sub.add_parser("compare", help="compare two sets of run capsules")
+    compare.add_argument("--config", default=argparse.SUPPRESS, help="path to mlforensics.toml")
     compare.add_argument("baseline")
     compare.add_argument("candidate")
     compare.add_argument(
@@ -104,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--threshold", action="append", default=[], metavar="METRIC=VALUE")
 
     bisect = sub.add_parser("bisect", help="bisect a stochastic Git regression")
+    bisect.add_argument("--config", default=argparse.SUPPRESS, help="path to mlforensics.toml")
     bisect.add_argument("--good", required=True)
     bisect.add_argument("--bad", required=True)
     bisect.add_argument("--repo", default=".")
@@ -137,6 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     bisect.add_argument("--json", action="store_true", dest="as_json")
 
     replay = sub.add_parser("replay", help="replay a captured failure when a command is supplied")
+    replay.add_argument("--config", default=argparse.SUPPRESS, help="path to mlforensics.toml")
     replay.add_argument("incident")
     replay.add_argument("--command", default=None)
     replay.add_argument("--step", type=int, default=None)
@@ -148,6 +153,9 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--json", action="store_true", dest="as_json")
 
     shrink_parser = sub.add_parser("shrink", help="shrink a JSON counterexample")
+    shrink_parser.add_argument(
+        "--config", default=argparse.SUPPRESS, help="path to mlforensics.toml"
+    )
     shrink_parser.add_argument("input")
     shrink_parser.add_argument(
         "--contains", default=None, help="preserve inputs containing this JSON string"
@@ -166,19 +174,21 @@ def build_parser() -> argparse.ArgumentParser:
     shrink_parser.add_argument("--json", action="store_true", dest="as_json")
 
     trace = sub.add_parser("trace", help="inspect bounded trace events in a capsule")
+    trace.add_argument("--config", default=argparse.SUPPRESS, help="path to mlforensics.toml")
     trace.add_argument("incident")
     trace.add_argument("--radius", type=int, default=8)
     trace.add_argument("--json", action="store_true", dest="as_json")
 
     impact = sub.add_parser("impact", help="plan validation after a Git or file change")
+    impact.add_argument("--config", default=argparse.SUPPRESS, help="path to mlforensics.toml")
     impact.add_argument("revision_range", nargs="?", default=None, help="BASE..HEAD")
     impact.add_argument("--base", default=None)
     impact.add_argument("--head", default="HEAD")
     impact.add_argument("--repo", default=".")
-    impact.add_argument("--config", dest="impact_config", default=None)
     impact.add_argument("--json", action="store_true", dest="as_json")
 
     parity = sub.add_parser("parity", help="compare callable, TorchScript, or ONNX models")
+    parity.add_argument("--config", default=argparse.SUPPRESS, help="path to mlforensics.toml")
     parity.add_argument("baseline", help="module:object, pytorch:PATH, or onnx:PATH")
     parity.add_argument("candidate", help="module:object, pytorch:PATH, or onnx:PATH")
     parity.add_argument("--inputs", default=None, help="JSON list of representative inputs")
@@ -196,6 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     parity.add_argument("--json", action="store_true", dest="as_json")
 
     ci = sub.add_parser("ci", help="run a statistical comparison as a CI gate")
+    ci.add_argument("--config", default=argparse.SUPPRESS, help="path to mlforensics.toml")
     ci.add_argument(
         "--baseline",
         required=True,
@@ -212,6 +223,13 @@ def build_parser() -> argparse.ArgumentParser:
     ci.add_argument("--resamples", type=int, default=2_000)
     ci.add_argument("--threshold", action="append", default=[], metavar="METRIC=VALUE")
     ci.add_argument("--json", action="store_true", dest="as_json")
+    ci.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("text", "json", "junit", "sarif", "github"),
+        default=None,
+        help="CI report format (json is also available as --json)",
+    )
     return parser
 
 
@@ -304,7 +322,16 @@ def _parse_thresholds(values: Sequence[str]) -> dict[str, float]:
         if "=" not in item:
             raise ValueError(f"threshold must have the form metric=value: {item}")
         name, value = item.split("=", 1)
-        result[name] = float(value)
+        name = name.strip()
+        if not name:
+            raise ValueError(f"threshold metric name cannot be empty: {item}")
+        try:
+            parsed = float(value)
+        except ValueError as exc:
+            raise ValueError(f"threshold value must be numeric: {item}") from exc
+        if not (parsed >= 0 and parsed < float("inf")):
+            raise ValueError(f"threshold value must be finite and non-negative: {item}")
+        result[name] = parsed
     return result
 
 
@@ -477,6 +504,119 @@ def _print(value: Any, *, as_json: bool, formatter=render) -> None:
         print(rendered, end="" if str(rendered).endswith("\n") else "\n")
 
 
+def _ci_report(value: Any, output_format: str) -> str:
+    """Serialize a CI result for common automation consumers."""
+    if output_format == "text":
+        return value.summary()
+    if output_format == "json":
+        return value.to_json()
+
+    checks = tuple(getattr(value, "checks", ()))
+    if output_format == "junit":
+        suite = ElementTree.Element(
+            "testsuite",
+            {
+                "name": "mlforensics",
+                "tests": str(len(checks)),
+                "failures": str(sum(check.status == "fail" for check in checks)),
+                "skipped": str(sum(check.status in {"warn", "skip"} for check in checks)),
+                "errors": "0",
+            },
+        )
+        for check in checks:
+            case = ElementTree.SubElement(
+                suite,
+                "testcase",
+                {"classname": "mlforensics", "name": check.name},
+            )
+            details = json.dumps(check.details, sort_keys=True, default=str)
+            if check.status == "fail":
+                failure = ElementTree.SubElement(
+                    case,
+                    "failure",
+                    {"type": check.check_id or "check", "message": check.name},
+                )
+                failure.text = details
+            elif check.status in {"warn", "skip"}:
+                skipped = ElementTree.SubElement(case, "skipped", {"message": check.name})
+                skipped.text = details
+        return ElementTree.tostring(suite, encoding="unicode")
+
+    if output_format == "sarif":
+        rules = []
+        results = []
+        for check in checks:
+            rule_id = check.check_id or "check"
+            rules.append(
+                {
+                    "id": rule_id,
+                    "name": check.name,
+                    "shortDescription": {"text": check.name},
+                }
+            )
+            level = {"fail": "error", "warn": "warning"}.get(check.status, "note")
+            results.append(
+                {
+                    "ruleId": rule_id,
+                    "level": level,
+                    "message": {"text": f"{check.name}: {check.status}"},
+                    "properties": {
+                        "passed": check.passed,
+                        "status": check.status,
+                        "details": dict(check.details),
+                    },
+                }
+            )
+        return json.dumps(
+            {
+                "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                "version": "2.1.0",
+                "runs": [
+                    {
+                        "tool": {"driver": {"name": "MLForensics", "rules": rules}},
+                        "results": results,
+                        "invocations": [
+                            {
+                                "executionSuccessful": bool(value.passed),
+                                "exitCode": value.exit_code,
+                            }
+                        ],
+                    }
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+
+    if output_format == "github":
+        annotations = []
+        for check in checks:
+            if check.status not in {"fail", "warn"}:
+                continue
+            annotations.append(
+                {
+                    "annotation_level": "failure" if check.status == "fail" else "warning",
+                    "title": check.name,
+                    "message": json.dumps(check.details, sort_keys=True, default=str),
+                }
+            )
+        payload = {
+            "name": "MLForensics",
+            "status": "completed",
+            "conclusion": "success" if value.passed else "failure",
+            "output": {
+                "title": "MLForensics CI gate",
+                "summary": value.summary(),
+                "text": "\n".join(f"{check.status}: {check.name}" for check in checks),
+            },
+            "annotations": annotations,
+        }
+        return json.dumps(payload, indent=2, sort_keys=True, default=str)
+
+    raise ValueError(f"unsupported CI report format: {output_format}")
+
+
 def _parse_shape(value: str | None) -> tuple[int, ...] | None:
     if value is None:
         return None
@@ -611,7 +751,7 @@ def _run(args: argparse.Namespace, config: Config) -> int:
         path,
         status=capsule.run.status,
     )
-    if not args.no_output and result is not None:
+    if not args.no_output and not args.as_json and result is not None:
         if result.stdout:
             print(result.stdout, end="")
         if result.stderr:
@@ -623,6 +763,8 @@ def _run(args: argparse.Namespace, config: Config) -> int:
                 "status": capsule.run.status,
                 "returncode": result.returncode if result else (127 if launch_error else None),
                 "child_instrumented": child_capsule is not None,
+                "stdout": result.stdout[-100_000:] if result is not None else "",
+                "stderr": result.stderr[-100_000:] if result is not None else "",
             },
             sort_keys=True,
         )
@@ -680,7 +822,10 @@ def _compare(args: argparse.Namespace, config: Config, *, gate: bool = False) ->
             required_evidence=required_evidence,
             min_sample_count=min_sample_count,
         )
-        print(result.to_json() if args.as_json else result.summary())
+        output_format = getattr(args, "output_format", None)
+        if output_format is None:
+            output_format = "json" if args.as_json else "text"
+        print(_ci_report(result, output_format))
         return result.exit_code
     comparison = compare_runs(
         baseline_paths,
@@ -1246,8 +1391,6 @@ def _trace(args: argparse.Namespace, config: Config) -> int:
 
 def _impact(args: argparse.Namespace, config: Config) -> int:
     mapping: dict[str, Any] = dict(config.impact)
-    if args.impact_config:
-        mapping = dict(load_config(args.impact_config).impact)
     if args.revision_range or args.base:
         base, head = (
             args.revision_range.split("..", 1) if args.revision_range else (args.base, args.head)
@@ -1273,6 +1416,15 @@ def _parity(args: argparse.Namespace) -> int:
             if Path(args.inputs).exists()
             else args.inputs
         )
+        if isinstance(inputs, Mapping):
+            if "cases" in inputs:
+                inputs = inputs["cases"]
+            elif "inputs" in inputs and isinstance(inputs["inputs"], list):
+                inputs = inputs["inputs"]
+            else:
+                inputs = [inputs]
+        if not isinstance(inputs, list):
+            raise ValueError("inputs must be a JSON list of cases or a named input mapping")
     else:
         if args.count < 1:
             raise ValueError("count must be positive")
@@ -1298,14 +1450,14 @@ def _parity(args: argparse.Namespace) -> int:
         input_spec=input_spec,
     )
     print(report.to_json(indent=2) if args.as_json else report.report())
-    return 0 if report.passed else 1
+    return report.exit_code
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    config = load_config(args.config)
     try:
+        config = load_config(getattr(args, "config", None))
         if args.subcommand == "run":
             return _run(args, config)
         if args.subcommand == "compare":

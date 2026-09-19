@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mlforensics.dev/schema/mlcap-1.schema.json",
+  "title": "MLForensics canonical run capsule",
+  "description": "The canonical JSON document stored as capsule.json in an mlcap-1 capsule.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "type", "run", "artifacts", "evidence"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "type": {"const": "run_capsule"},
+    "run": {"$ref": "#/$defs/run"},
+    "artifacts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/artifact_ref"}
+    },
+    "evidence": {"$ref": "#/$defs/json_object"},
+    "features": {"$ref": "#/$defs/json_object"},
+    "provenance": {"$ref": "#/$defs/json_object"},
+    "migration_history": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    }
+  },
+  "$defs": {
+    "json_value": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "boolean"},
+        {"type": "number"},
+        {"type": "string"},
+        {"type": "array", "items": {"$ref": "#/$defs/json_value"}},
+        {"$ref": "#/$defs/json_object"}
+      ]
+    },
+    "json_object": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/json_value"}
+    },
+    "record": {
+      "type": "object",
+      "required": ["schema_version", "type"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "type": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": true
+    },
+    "artifact_ref": {
+      "allOf": [
+        {"$ref": "#/$defs/record"},
+        {
+          "required": ["name", "uri", "sha256", "size_bytes", "media_type", "metadata"],
+          "properties": {
+            "type": {"const": "artifact_ref"},
+            "name": {"type": "string", "minLength": 1},
+            "uri": {"type": "string"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$|^$"},
+            "size_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "media_type": {"type": ["string", "null"]},
+            "metadata": {"$ref": "#/$defs/json_object"}
+          }
+        }
+      ]
+    },
+    "run": {
+      "allOf": [
+        {"$ref": "#/$defs/record"},
+        {
+          "required": [
+            "run_id", "name", "status", "started_at", "ended_at", "metadata",
+            "datasets", "models", "metrics", "resources", "events", "rng_state",
+            "failure_signature", "lineage_nodes", "lineage_edges", "observations",
+            "replay_plan"
+          ],
+          "properties": {
+            "type": {"const": "run"},
+            "run_id": {"type": "string", "minLength": 1},
+            "name": {"type": "string"},
+            "status": {"type": "string"},
+            "started_at": {"type": "string"},
+            "ended_at": {"type": ["string", "null"]},
+            "metadata": {"$ref": "#/$defs/json_object"},
+            "datasets": {"type": "array", "items": {"$ref": "#/$defs/record"}},
+            "models": {"type": "array", "items": {"$ref": "#/$defs/record"}},
+            "metrics": {"type": "array", "items": {"$ref": "#/$defs/record"}},
+            "resources": {"type": "array", "items": {"$ref": "#/$defs/record"}},
+            "events": {"type": "array", "items": {"$ref": "#/$defs/record"}},
+            "rng_state": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/record"}]},
+            "failure_signature": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/record"}]},
+            "lineage_nodes": {"type": "array", "items": {"$ref": "#/$defs/record"}},
+            "lineage_edges": {"type": "array", "items": {"$ref": "#/$defs/record"}},
+            "observations": {"type": "array", "items": {"$ref": "#/$defs/record"}},
+            "replay_plan": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/record"}]}
+          }
+        }
+      ]
+    }
+  }
+}

@@ -106,7 +106,10 @@ class DependencyGraph:
         target_id = target.id if isinstance(target, Node) else str(target)
         self.add_node(source_id)
         self.add_node(target_id)
-        edge = Edge(source_id, target_id, kind, {**dict(metadata or {}), **extra})
+        edge_metadata = {**dict(metadata or {}), **extra}
+        edge_metadata.setdefault("confidence", "medium")
+        edge_metadata.setdefault("explanation", f"{kind} dependency")
+        edge = Edge(source_id, target_id, kind, edge_metadata)
         self.edges[(source_id, target_id, kind)] = edge
         return edge
 

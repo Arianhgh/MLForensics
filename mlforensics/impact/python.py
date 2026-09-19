@@ -73,10 +73,62 @@ class _FileVisitor(ast.NodeVisitor):
             return None
 
         name = dotted(node.func)
+        dynamic_import = False
+        dynamic_module: str | None = None
+        if isinstance(node.func, ast.Name) and node.func.id == "__import__":
+            dynamic_import = True
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "importlib"
+            and node.func.attr == "import_module"
+        ):
+            dynamic_import = True
+        if dynamic_import:
+            if (
+                node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and node.args[0].value.strip()
+            ):
+                dynamic_module = node.args[0].value.strip()
+                dynamic_target = f"unknown:module:{dynamic_module}"
+                self.graph.add_node(
+                    dynamic_target,
+                    kind="module",
+                    name=dynamic_module,
+                    metadata={"dynamic": True},
+                )
+                caller = f"{self.module}:{'.'.join(self.scope)}" if self.scope else self.file_node
+                self.graph.add_edge(
+                    caller,
+                    dynamic_target,
+                    "imports",
+                    confidence="low",
+                    explanation="dynamic import with a static module name",
+                )
+            else:
+                dynamic_target = "unknown:dynamic-import"
+                self.graph.add_node(
+                    dynamic_target,
+                    kind="unknown",
+                    name="dynamic import",
+                    path=str(self.file_path),
+                    metadata={"conservative": True},
+                )
+                caller = f"{self.module}:{'.'.join(self.scope)}" if self.scope else self.file_node
+                self.graph.add_edge(
+                    caller,
+                    dynamic_target,
+                    "imports",
+                    confidence="low",
+                    explanation="dynamic import target is not statically known",
+                )
         target = self.symbols.get(name or "")
         if target is None and name:
             for alias, imported_module in sorted(
-                self.imported_modules.items(), key=lambda item: len(item[1]), reverse=True
+                self.imported_modules.items(),
+                key=lambda item: (-len(item[1]), item[0], item[1]),
             ):
                 if name == alias:
                     target = imported_module
@@ -120,21 +172,49 @@ class PythonAnalyzer:
 
     def analyze(self, paths: Iterable[str | Path] | None = None) -> DependencyGraph:
         graph = DependencyGraph()
-        files = (
-            [Path(path).resolve() for path in paths]
-            if paths is not None
-            else sorted(self.root.rglob("*.py"))
-        )
-        module_paths = {module_name(path, self.root): path for path in files if path.exists()}
+        self.errors = []
+        if paths is None:
+            candidates = sorted(self.root.rglob("*.py"), key=lambda item: item.as_posix())
+        else:
+            candidates = [
+                (Path(path) if Path(path).is_absolute() else self.root / Path(path)).resolve()
+                for path in paths
+            ]
+        files: list[Path] = []
+        seen: set[str] = set()
+        for path in candidates:
+            resolved = path.resolve()
+            if self.root != resolved and self.root not in resolved.parents:
+                self.errors.append(
+                    {"path": str(resolved), "error": "path is outside the analysis root"}
+                )
+                continue
+            key = resolved.as_posix()
+            if key not in seen:
+                seen.add(key)
+                files.append(resolved)
+        files.sort(key=lambda item: item.as_posix())
+        module_paths: dict[str, Path] = {}
+        for path in files:
+            if not path.exists():
+                continue
+            try:
+                module_paths[module_name(path, self.root)] = path
+            except ValueError as exc:
+                self.errors.append({"path": str(path), "error": str(exc)})
         for path in files:
             if not path.is_file():
                 continue
-            module = module_name(path, self.root)
+            try:
+                module = module_name(path, self.root)
+            except ValueError as exc:
+                self.errors.append({"path": str(path), "error": str(exc)})
+                continue
             file_node = f"file:{path.as_posix()}"
             graph.add_node(file_node, kind="file", name=module, path=str(path))
             try:
                 tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-            except (OSError, SyntaxError) as exc:
+            except (OSError, SyntaxError, UnicodeError, ValueError) as exc:
                 self.errors.append({"path": str(path), "error": str(exc)})
                 continue
             # Keep imported aliases in the same symbol table as local
@@ -160,6 +240,9 @@ class PythonAnalyzer:
                                 explanation=f"absolute import {imported}",
                             )
                         bound_name = alias.asname or alias.name.split(".")[0]
+                        # Keep the full imported module as the value even
+                        # when Python binds the root package name.  The file
+                        # visitor uses the suffix to resolve ``pkg.mod.fn``.
                         imported_modules[bound_name] = imported
                 elif isinstance(node, ast.ImportFrom):
                     imported = node.module or ""
@@ -191,14 +274,19 @@ class PythonAnalyzer:
                         for alias in node.names:
                             if alias.name == "*":
                                 continue
-                            symbol_id = f"{imported}:{alias.name}"
+                            submodule_name = f"{imported}.{alias.name}" if imported else alias.name
+                            submodule_target = module_paths.get(submodule_name)
+                            if submodule_target is not None:
+                                symbol_id = f"file:{submodule_target.as_posix()}"
+                            else:
+                                symbol_id = f"{imported}:{alias.name}"
                             imported_symbols[alias.asname or alias.name] = symbol_id
-                            if imported in module_paths:
+                            if imported in module_paths or submodule_target is not None:
                                 graph.add_node(
                                     symbol_id,
                                     kind="imported_symbol",
                                     name=alias.name,
-                                    path=str(target),
+                                    path=str(submodule_target or target),
                                 )
                                 graph.add_edge(
                                     file_node,

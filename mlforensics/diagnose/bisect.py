@@ -8,8 +8,10 @@ import json
 import math
 import os
 import random
+import shutil
 import statistics
 import subprocess
+import time
 import uuid
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
@@ -37,8 +39,23 @@ class SubprocessGit:
     """Minimal Git adapter used only when a caller explicitly requests Git."""
 
     def __init__(self, repo: str = ".") -> None:
-        self.repo = repo
+        self.repo = str(Path(repo).resolve())
         self.revision: str | None = None
+        self.working_directory = self.repo
+
+    def preflight(self) -> None:
+        """Reject a dirty checkout before a bisect can disturb user work."""
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=self.repo,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        if result.stdout.strip():
+            raise RuntimeError(
+                "bisect requires a clean checkout; use WorktreeGit to preserve local changes"
+            )
 
     def commits(self, good: str | None = None, bad: str = "HEAD") -> list[str]:
         revisions = ["git", "rev-list", "--reverse"]
@@ -62,6 +79,7 @@ class SubprocessGit:
             text=True,
         )
         self.revision = revision
+        self.working_directory = self.repo
 
     def current_revision(self) -> str:
         """Return a restorable branch name, or the detached commit hash."""
@@ -84,6 +102,95 @@ class SubprocessGit:
 
     def restore(self, revision: str) -> None:
         self.checkout(revision)
+
+
+class WorktreeGit:
+    """Evaluate revisions in isolated Git worktrees instead of the main checkout."""
+
+    def __init__(self, repo: str = ".", *, root: str | os.PathLike[str] | None = None) -> None:
+        self.repo = str(Path(repo).resolve())
+        self.revision: str | None = None
+        self.working_directory: str = self.repo
+        self._parent_root = Path(root).resolve() if root is not None else None
+        self._root: Path | None = None
+        self._worktrees: dict[str, Path] = {}
+        self._owns_root = True
+
+    def preflight(self) -> None:
+        """Validate the source repository without inspecting its dirty state."""
+        subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=self.repo,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+    def commits(self, good: str | None = None, bad: str = "HEAD") -> list[str]:
+        return SubprocessGit(self.repo).commits(good, bad)
+
+    def checkout(self, revision: str) -> None:
+        if revision in self._worktrees:
+            self.working_directory = str(self._worktrees[revision])
+            self.revision = revision
+            return
+        if self._root is None:
+            import tempfile
+
+            if self._parent_root is None:
+                self._root = Path(tempfile.mkdtemp(prefix="mlforensics-worktrees-"))
+            else:
+                self._parent_root.mkdir(parents=True, exist_ok=True)
+                self._root = Path(tempfile.mkdtemp(prefix="bisect-", dir=str(self._parent_root)))
+        token = hashlib.sha256(revision.encode("utf-8")).hexdigest()[:20]
+        path = self._root / token
+        if path.exists():
+            # A path from an interrupted run is not evidence of a valid
+            # worktree.  Never attach to it or remove it implicitly.
+            raise RuntimeError(f"worktree path already exists: {path}")
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(path), revision],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self._worktrees[revision] = path
+        self.working_directory = str(path)
+        self.revision = revision
+
+    def current_revision(self) -> str:
+        return SubprocessGit(self.repo).current_revision()
+
+    def restore(self, revision: str) -> None:
+        self.revision = revision
+        # The source checkout was never changed; restoration means returning
+        # the runner context to it, not selecting an old evaluation worktree.
+        self.working_directory = self.repo
+
+    def cleanup(self) -> None:
+        for path in self._worktrees.values():
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(path)],
+                cwd=self.repo,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self._worktrees.clear()
+        self.working_directory = self.repo
+        if self._owns_root and self._root is not None:
+            shutil.rmtree(self._root, ignore_errors=True)
+        self._root = None
+
+    close = cleanup
+
+    def __enter__(self) -> WorktreeGit:
+        self.preflight()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.cleanup()
 
 
 def bytecode_isolation_env(revision: str | None, root: str | os.PathLike[str]) -> dict[str, str]:
@@ -182,6 +289,22 @@ def _invoke(runner: Callable[..., Any], target: str, seed: int) -> Any:
     return runner(target)
 
 
+def _invoke_bisect_runner(runner: Callable[..., Any], seed: int, git: Any) -> Any:
+    """Call a Git runner, optionally supplying an isolated worktree path."""
+    working_directory = getattr(git, "working_directory", None)
+    if working_directory is None:
+        return runner(seed)
+    try:
+        parameters = inspect.signature(runner).parameters
+    except (TypeError, ValueError):
+        return runner(seed)
+    if "working_directory" in parameters:
+        return runner(seed, working_directory=working_directory)
+    if "cwd" in parameters:
+        return runner(seed, cwd=working_directory)
+    return runner(seed)
+
+
 def _to_score(value: Any) -> tuple[bool | None, float | None, dict[str, Any]]:
     if isinstance(value, Mapping):
         passed = value.get("passed", value.get("good"))
@@ -206,6 +329,83 @@ def _canonical_identity(value: Any) -> str:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError):
         return repr(value)
+
+
+def _callable_identity(value: Any) -> str | None:
+    """Return a conservative identity for a user supplied executable."""
+    if value is None:
+        return None
+    target = getattr(value, "__func__", value)
+    code = getattr(target, "__code__", None)
+    payload: dict[str, Any] = {
+        "module": getattr(target, "__module__", type(target).__module__),
+        "qualname": getattr(target, "__qualname__", type(target).__qualname__),
+    }
+    if code is not None:
+        payload["code"] = hashlib.sha256(code.co_code).hexdigest()
+        payload["consts"] = repr(code.co_consts)
+        closure = getattr(target, "__closure__", None)
+        if closure:
+            payload["closure"] = [repr(cell.cell_contents) for cell in closure]
+    else:
+        payload["repr"] = repr(target)
+    return _canonical_identity(payload)
+
+
+def _decode_cache_value(value: Any) -> Any:
+    """Decode values written by :class:`BisectCache` without trusting reprs."""
+    if isinstance(value, Mapping):
+        marker = value.get("__mlforensics_cache_type__")
+        if marker == "failure_signature":
+            candidate = value.get("value")
+            if not isinstance(candidate, Mapping):
+                return value
+            try:
+                return FailureSignature.from_dict(candidate)
+            except (TypeError, ValueError):
+                return value
+        if marker == "unserializable":
+            # The original object cannot be reconstructed.  Treating its
+            # repr as evidence would make a resume silently change meaning.
+            return value
+        return {key: _decode_cache_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_decode_cache_value(item) for item in value]
+    return value
+
+
+def _cache_value_is_reconstructable(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        if value.get("__mlforensics_cache_type__") == "unserializable":
+            return False
+        return all(_cache_value_is_reconstructable(item) for item in value.values())
+    if isinstance(value, list):
+        return all(_cache_value_is_reconstructable(item) for item in value)
+    return True
+
+
+def _budget_limit(budget: Any, name: str) -> float | int | None:
+    if budget is None:
+        return None
+    value = budget.get(name) if isinstance(budget, Mapping) else getattr(budget, name, None)
+    return value
+
+
+def _reported_resource(value: Any, names: set[str]) -> float:
+    if not isinstance(value, Mapping):
+        return 0.0
+    total = 0.0
+    for key, item in value.items():
+        if str(key) in names:
+            try:
+                number = float(item)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number) and number >= 0:
+                total += number
+        elif str(key) in {"metadata", "resources"}:
+            total += _reported_resource(item, names)
+    return total
 
 
 def _predicate_outcome(
@@ -339,6 +539,8 @@ class StochasticBisector:
             raise ValueError("confidence must be between 0 and 1")
         self.good, self.bad, self.runner = good, bad, runner
         self.seeds = [int(seed) for seed in seeds]
+        if len(set(self.seeds)) != len(self.seeds):
+            raise ValueError("seeds must be unique so observations can be paired safely")
         self.regression_threshold = abs(float(regression_threshold))
         self.higher_is_better = higher_is_better
         self.confidence = confidence
@@ -363,6 +565,7 @@ class StochasticBisector:
             "confidence": float(confidence),
             "max_runs_per_target": self.max_runs_per_target,
             "deterministic": self.deterministic,
+            "failure_predicate": _callable_identity(self.failure_predicate),
         }
         persistent_cache = (
             isinstance(cache, BisectCache) and getattr(cache, "path", None) is not None
@@ -370,6 +573,8 @@ class StochasticBisector:
         if isinstance(cache_identity, Mapping):
             default_identity.update(dict(cache_identity))
             cache_identity = default_identity
+        elif cache_identity is not None:
+            cache_identity = {**default_identity, "user_identity": cache_identity}
         elif cache_identity is None:
             if persistent_cache:
                 # Arbitrary Python runners cannot be serialized into a stable
@@ -772,14 +977,21 @@ class BisectCache:
         if self.path is not None and self.path.is_file():
             try:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
+                if not isinstance(raw, Mapping):
+                    raise ValueError("bisect cache root must be an object")
+                if raw.get("version") != 2:
+                    raise ValueError("unsupported bisect cache version")
                 for item in raw.get("entries", []):
                     revision = str(item["revision"])
                     seed = int(item["seed"])
                     namespace = str(item.get("identity", ""))
+                    if not _cache_value_is_reconstructable(item["value"]):
+                        continue
+                    value = _decode_cache_value(item["value"])
                     if namespace:
-                        self.namespaced_values[(namespace, revision, seed)] = item["value"]
+                        self.namespaced_values[(namespace, revision, seed)] = value
                     else:
-                        self.values[(revision, seed)] = item["value"]
+                        self.values[(revision, seed)] = value
             except (OSError, ValueError, TypeError, KeyError):
                 # A stale or interrupted cache must never prevent a diagnosis.
                 self.values = {}
@@ -908,6 +1120,7 @@ def bisect_commits(
     higher_is_better: bool = False,
     n_resamples: int = 2_000,
     max_runs: int | None = None,
+    budget: Mapping[str, Any] | Any | None = None,
     min_observations: int | None = None,
     good: str | None = None,
     bad: str = "HEAD",
@@ -918,6 +1131,7 @@ def bisect_commits(
     configuration: Mapping[str, Any] | None = None,
     failure_predicate: Callable[[Any], bool] | None = None,
     predicate: Callable[[Any], bool] | None = None,
+    detect_nonmonotonic: bool = True,
 ) -> BisectReport:
     """Checkout and evaluate only the logarithmic set of revisions needed."""
     if failure_predicate is None:
@@ -926,6 +1140,9 @@ def bisect_commits(
         isinstance(min_observations, bool) or int(min_observations) < 1
     ):
         raise ValueError("min_observations must be a positive integer")
+    seed_list = [int(seed) for seed in seeds]
+    if len(set(seed_list)) != len(seed_list):
+        raise ValueError("seeds must be unique so observations can be paired safely")
     if good is None:
         revisions = list(git.commits())
     else:
@@ -940,23 +1157,58 @@ def bisect_commits(
             revisions = all_revisions[all_revisions.index(good) : end]
     if len(revisions) < 2:
         return BisectReport(None, metadata={"reason": "fewer than two revisions"})
-    if max_runs is not None and max_runs < 2:
+    if max_runs is not None and (
+        isinstance(max_runs, bool) or not isinstance(max_runs, int) or max_runs < 2
+    ):
         raise ValueError("max_runs must allow at least the good and bad revisions")
-    identity = execution_identity
-    if identity is None:
-        identity = {
-            "schema_version": 2,
-            "repository": str(getattr(git, "repo", "")),
-            "code_revision": {"good": good, "bad": bad},
-            "command": command,
-            "harness": command,
-            "metric": metric,
-            "higher_is_better": bool(higher_is_better),
-            "tolerance": float(tolerance),
-            "environment_fingerprint": environment_fingerprint,
-            "configuration": dict(configuration or {}),
-            "seeds": [int(seed) for seed in seeds],
-        }
+    budget_run_count = _budget_limit(budget, "run_count")
+    if budget_run_count is not None and (
+        isinstance(budget_run_count, bool)
+        or not isinstance(budget_run_count, int)
+        or budget_run_count < 0
+    ):
+        raise ValueError("budget.run_count must be a non-negative integer")
+    budget_limits = {
+        name: _budget_limit(budget, name)
+        for name in ("run_count", "wall_clock_s", "gpu_hours", "currency")
+    }
+    for name in ("wall_clock_s", "gpu_hours", "currency"):
+        value = budget_limits[name]
+        if value is not None:
+            try:
+                valid = math.isfinite(float(value)) and float(value) >= 0
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                raise ValueError(f"budget.{name} must be a non-negative finite number")
+    run_limit = max_runs
+    if budget_run_count is not None:
+        run_limit = budget_run_count if run_limit is None else min(run_limit, int(budget_run_count))
+    identity_defaults: dict[str, Any] = {
+        "schema_version": 2,
+        "repository": str(getattr(git, "repo", "")),
+        "code_revision": {"good": good, "bad": bad},
+        "command": command,
+        "harness": command,
+        "metric": metric,
+        "higher_is_better": bool(higher_is_better),
+        "tolerance": float(tolerance),
+        "confidence": float(confidence),
+        "n_resamples": int(n_resamples),
+        "environment_fingerprint": environment_fingerprint,
+        "configuration": dict(configuration or {}),
+        "seeds": seed_list,
+        "min_observations": min_observations,
+        "failure_predicate": _callable_identity(failure_predicate),
+    }
+    if isinstance(execution_identity, Mapping):
+        # An explicit identity may add harness-specific inputs, but cannot
+        # accidentally remove the standard inputs that protect cached data.
+        identity = {**identity_defaults, **dict(execution_identity)}
+    elif execution_identity is not None:
+        identity = {**identity_defaults, "user_identity": execution_identity}
+    else:
+        identity = identity_defaults
         if command is None:
             identity = {
                 **identity,
@@ -965,7 +1217,6 @@ def bisect_commits(
             }
     identity_token = _canonical_identity(identity)
     cache = cache if cache is not None else BisectCache()
-    seed_list = [int(seed) for seed in seeds]
     if min_observations is not None:
         required_seeds = int(min_observations)
     elif failure_predicate is not None:
@@ -980,17 +1231,25 @@ def bisect_commits(
             f"revision but {len(seed_list)} were supplied; pass more seeds or lower "
             f"min_observations (accepting weaker evidence)"
         )
+    required_observations = required_seeds
     raw: dict[str, list[Any]] = {}
     decisions: dict[str, RegressionDecision] = {}
     evaluations: list[RunOutcome] = []
     executed_runs = 0
+    cache_hits = 0
+    budget_consumed = {"wall_clock_s": 0.0, "gpu_hours": 0.0, "currency": 0.0}
+    budget_exhausted = False
+    started_at = time.monotonic()
     original_revision = None
+    preflight = getattr(git, "preflight", None)
+    if callable(preflight):
+        preflight()
     current_revision = getattr(git, "current_revision", None)
     if callable(current_revision):
         original_revision = current_revision()
 
     def evaluate(revision: str) -> list[Any]:
-        nonlocal executed_runs
+        nonlocal budget_exhausted, cache_hits, executed_runs
         if revision in raw:
             return raw[revision]
         git.checkout(revision)
@@ -1005,12 +1264,27 @@ def bisect_commits(
                     key = (identity_token, revision, seed)
                 value = cache.get(key, sentinel)  # type: ignore[union-attr]
             if value is not sentinel:
-                pass
+                cache_hits += 1
             else:
-                if max_runs is not None and executed_runs >= max_runs:
+                elapsed = time.monotonic() - started_at
+                budget_consumed["wall_clock_s"] = elapsed
+                if run_limit is not None and executed_runs >= run_limit:
+                    budget_exhausted = True
+                    break
+                if budget_limits["wall_clock_s"] is not None and elapsed >= float(
+                    budget_limits["wall_clock_s"]
+                ):
+                    budget_exhausted = True
+                    break
+                if any(
+                    budget_limits[name] is not None
+                    and budget_consumed[name] >= float(budget_limits[name])
+                    for name in ("gpu_hours", "currency")
+                ):
+                    budget_exhausted = True
                     break
                 try:
-                    value = runner(seed)
+                    value = _invoke_bisect_runner(runner, seed, git)
                 except Exception as exc:
                     # A revision-level exception is evidence, not a reason to
                     # abort the entire search.  Signature predicates can
@@ -1024,6 +1298,17 @@ def bisect_commits(
                         key = (identity_token, revision, seed)
                     cache[key] = value  # type: ignore[index]
                 executed_runs += 1
+                budget_consumed["gpu_hours"] += _reported_resource(value, {"gpu_hours"})
+                budget_consumed["currency"] += _reported_resource(
+                    value, {"currency", "cost", "cost_usd"}
+                )
+                budget_consumed["wall_clock_s"] = time.monotonic() - started_at
+                if any(
+                    budget_limits[name] is not None
+                    and budget_consumed[name] >= float(budget_limits[name])
+                    for name in ("gpu_hours", "currency")
+                ):
+                    budget_exhausted = True
             values.append(value)
         raw[revision] = values
         return values
@@ -1035,10 +1320,33 @@ def bisect_commits(
         baseline_ids: Sequence[int] | None = None,
     ) -> RunOutcome:
         normalized = [_to_score(value) for value in values]
+        observation_ids = seed_list[: len(values)]
+        observation_metadata = {
+            "observation_ids": list(observation_ids),
+            "missing_observation_ids": seed_list[len(values) :],
+        }
         if failure_predicate is not None:
-            return _predicate_outcome(revision, values, failure_predicate)
+            return _predicate_outcome(
+                revision,
+                values,
+                failure_predicate,
+                metadata=observation_metadata,
+            )
         flags = [flag for flag, _score, _details in normalized if flag is not None]
         if flags:
+            if len(flags) < required_observations:
+                return RunOutcome(
+                    revision,
+                    True,
+                    runs=len(values),
+                    metadata={
+                        **observation_metadata,
+                        "votes": flags,
+                        "inconclusive": True,
+                        "reason": "insufficient observations",
+                        "required_observations": required_observations,
+                    },
+                )
             passing = sum(bool(flag) for flag in flags)
             tied = len(flags) % 2 == 0 and passing == len(flags) / 2
             passed = passing > len(flags) / 2
@@ -1046,9 +1354,9 @@ def bisect_commits(
                 revision,
                 passed,
                 runs=len(values),
-                metadata={"votes": flags, "inconclusive": tied},
+                metadata={**observation_metadata, "votes": flags, "inconclusive": tied},
             )
-        ids = list(seed_list[: len(values)])
+        ids = list(observation_ids)
         scores_by_seed = {
             seed: score
             for seed, (_flag, score, _details) in zip(ids, normalized)
@@ -1061,7 +1369,25 @@ def bisect_commits(
                     revision,
                     True,
                     runs=0,
-                    metadata={"inconclusive": True, "reason": "no usable endpoint evidence"},
+                    metadata={
+                        **observation_metadata,
+                        "inconclusive": True,
+                        "reason": "no usable endpoint evidence",
+                    },
+                )
+            if len(scores) < required_observations:
+                return RunOutcome(
+                    revision,
+                    True,
+                    score=statistics.fmean(scores),
+                    samples=scores,
+                    runs=len(scores),
+                    metadata={
+                        **observation_metadata,
+                        "inconclusive": True,
+                        "reason": "insufficient observations",
+                        "required_observations": required_observations,
+                    },
                 )
             return RunOutcome(
                 revision,
@@ -1069,6 +1395,7 @@ def bisect_commits(
                 score=statistics.fmean(scores) if scores else None,
                 samples=scores,
                 runs=len(scores),
+                metadata=observation_metadata,
             )
         base_ids = list(baseline_ids or seed_list[: len(baseline)])
         base_scores_by_seed = {
@@ -1083,14 +1410,12 @@ def bisect_commits(
         )
         if not paired_base or not paired_candidate:
             return RunOutcome(
-                revision, True, samples=scores, runs=len(scores), metadata={"inconclusive": True}
+                revision,
+                True,
+                samples=scores,
+                runs=len(scores),
+                metadata={**observation_metadata, "inconclusive": True},
             )
-        if min_observations is not None:
-            required_observations = int(min_observations)
-        elif failure_predicate is not None:
-            required_observations = 1
-        else:
-            required_observations = MIN_STOCHASTIC_OBSERVATIONS
         if len(paired_ids) < required_observations:
             return RunOutcome(
                 revision,
@@ -1098,6 +1423,7 @@ def bisect_commits(
                 samples=scores,
                 runs=len(scores),
                 metadata={
+                    **observation_metadata,
                     "inconclusive": True,
                     "reason": "insufficient matched observations",
                     "required_observations": required_observations,
@@ -1124,6 +1450,7 @@ def bisect_commits(
             confidence_interval=(decision.lower, decision.upper),
             runs=len(scores),
             metadata={
+                **observation_metadata,
                 "status": decision.status.value,
                 "inconclusive": decision.status is RegressionStatus.INCONCLUSIVE,
                 "paired_observation_ids": list(paired_ids),
@@ -1144,7 +1471,12 @@ def bisect_commits(
         evaluations.extend([good_outcome, bad_outcome])
         metadata = {
             "executed_runs": executed_runs,
+            "cache_hits": cache_hits,
+            "resumed": cache_hits > 0,
             "max_runs": max_runs,
+            "budget": budget_limits,
+            "budget_consumed": dict(budget_consumed),
+            "budget_exhausted": budget_exhausted,
             "execution_identity": identity_token,
             "paired_seeds": list(seed_list),
         }
@@ -1173,11 +1505,15 @@ def bisect_commits(
             )
         low, high = 0, len(revisions) - 1
         inconclusive: list[str] = []
+        outcome_by_revision = {
+            item.target: item for item in evaluations if item.target in revisions
+        }
         while high - low > 1:
             middle = (low + high) // 2
             current_values = evaluate(revisions[middle])
             current = outcome(revisions[middle], current_values, good_values)
             evaluations.append(current)
+            outcome_by_revision[revisions[middle]] = current
             if current.inconclusive:
                 inconclusive.append(revisions[middle])
                 return BisectReport(
@@ -1188,12 +1524,67 @@ def bisect_commits(
                     {
                         **metadata,
                         "reason": "an intermediate revision is statistically inconclusive",
+                        "executed_runs": executed_runs,
+                        "budget_consumed": dict(budget_consumed),
+                        "budget_exhausted": budget_exhausted,
                     },
                 )
             if current.passed:
                 low = middle
             else:
                 high = middle
+
+        if detect_nonmonotonic:
+            # A binary search cannot observe a good revision hidden after an
+            # earlier bad one.  The bounded scan turns that ambiguity into an
+            # explicit result and, on monotonic histories, records evidence for
+            # every revision that was needed to prove the claim.
+            for revision in revisions:
+                if revision in outcome_by_revision:
+                    continue
+                current_values = evaluate(revision)
+                current = outcome(revision, current_values, good_values)
+                evaluations.append(current)
+                outcome_by_revision[revision] = current
+                if current.inconclusive:
+                    inconclusive.append(revision)
+                    return BisectReport(
+                        None,
+                        decisions,
+                        evaluations,
+                        inconclusive,
+                        {
+                            **metadata,
+                            "executed_runs": executed_runs,
+                            "budget_consumed": dict(budget_consumed),
+                            "budget_exhausted": budget_exhausted,
+                            "reason": "nonmonotonicity scan is inconclusive",
+                        },
+                    )
+            statuses = [not outcome_by_revision[revision].passed for revision in revisions]
+            first_bad_index = next((index for index, is_bad in enumerate(statuses) if is_bad), None)
+            violation = first_bad_index is not None and any(
+                statuses[index] is False for index in range(first_bad_index + 1, len(statuses))
+            )
+            if violation:
+                return BisectReport(
+                    None,
+                    decisions,
+                    evaluations,
+                    [revisions[index] for index, is_bad in enumerate(statuses) if is_bad],
+                    {
+                        **metadata,
+                        "executed_runs": executed_runs,
+                        "budget_consumed": dict(budget_consumed),
+                        "budget_exhausted": budget_exhausted,
+                        "nonmonotonic": True,
+                        "reason": "revision history is nonmonotonic; first bad is ambiguous",
+                    },
+                )
+            high = first_bad_index if first_bad_index is not None else high
+        metadata["executed_runs"] = executed_runs
+        metadata["budget_consumed"] = dict(budget_consumed)
+        metadata["budget_exhausted"] = budget_exhausted
         return BisectReport(
             revisions[high],
             decisions,
@@ -1202,6 +1593,11 @@ def bisect_commits(
             metadata,
         )
     finally:
-        restore = getattr(git, "restore", None)
-        if original_revision is not None and callable(restore):
-            restore(original_revision)
+        try:
+            restore = getattr(git, "restore", None)
+            if original_revision is not None and callable(restore):
+                restore(original_revision)
+        finally:
+            cleanup = getattr(git, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
