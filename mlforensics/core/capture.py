@@ -344,6 +344,29 @@ class CaptureContext:
         return identity
 
     @staticmethod
+    def _identity_kind(step: int | float | None, metadata: Mapping[str, Any] | None) -> str:
+        metadata = metadata or {}
+        if any(
+            key in metadata and metadata[key] is not None
+            for key in ("identity", "observation_id", "sample_id", "case_id", "seed")
+        ):
+            return "declared"
+        return "step" if step is not None else "position"
+
+    @staticmethod
+    def _series_metadata(
+        current: Mapping[str, Any], incoming: Mapping[str, Any], identity_kind: str
+    ) -> dict[str, Any]:
+        previous = current.get("_mlforensics_identity_kind")
+        if previous is not None and previous != identity_kind:
+            identity_kind = "mixed"
+        return {
+            **dict(current),
+            **dict(incoming),
+            "_mlforensics_identity_kind": identity_kind,
+        }
+
+    @staticmethod
     def _series_identities(series: MetricSeries | ResourceSeries) -> tuple[Any, ...]:
         if getattr(series, "identities", ()):
             return tuple(series.identities)
@@ -421,6 +444,7 @@ class CaptureContext:
         if not isinstance(name, str) or not name.strip():
             raise ValueError("metric name must be a non-empty string")
         identity = self._next_observation_identity("metric", name, step, metadata)
+        identity_kind = self._identity_kind(step, metadata)
         if not self._is_finite_number(value):
             return self._record_nonfinite_observation(
                 name,
@@ -428,7 +452,7 @@ class CaptureContext:
                 kind="metric",
                 step=step,
                 timestamp=timestamp,
-                metadata=metadata,
+                metadata=self._series_metadata({}, metadata, identity_kind),
                 identity=identity,
             )
         value = float(value)
@@ -473,7 +497,7 @@ class CaptureContext:
             values=tuple(current.values) + (value,),
             steps=steps,
             timestamps=timestamps,
-            metadata={**dict(current.metadata), **metadata},
+            metadata=self._series_metadata(current.metadata, metadata, identity_kind),
             identities=identities,
         )
         self._metrics[index] = series
@@ -548,6 +572,7 @@ class CaptureContext:
         """Append a value to a named resource series."""
         self._ensure_open()
         identity = self._next_observation_identity("resource", name, step, metadata)
+        identity_kind = self._identity_kind(step, metadata)
         if not self._is_finite_number(value):
             return self._record_nonfinite_observation(
                 name,
@@ -568,7 +593,7 @@ class CaptureContext:
                 values=(value,),
                 steps=(step,) if step is not None else (),
                 units=units,
-                metadata=metadata,
+                metadata=self._series_metadata({}, metadata, identity_kind),
                 identities=(identity,),
             )
             self._resources.append(series)
@@ -584,7 +609,7 @@ class CaptureContext:
             values=tuple(current.values) + (value,),
             steps=steps,
             units=units or current.units,
-            metadata={**dict(current.metadata), **metadata},
+            metadata=self._series_metadata(current.metadata, metadata, identity_kind),
             identities=self._series_identities(current) + (identity,),
         )
         self._resources[index] = series

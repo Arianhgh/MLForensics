@@ -154,7 +154,7 @@ class ExecutionService:
                 stdout, stderr = process.communicate()
             else:
                 deadline = None if spec.timeout is None else time.monotonic() + float(spec.timeout)
-                while process.poll() is None:
+                while True:
                     if cancel_event is not None and cancel_event.is_set():
                         cancelled = True
                         _terminate_group(process)
@@ -163,15 +163,17 @@ class ExecutionService:
                         timed_out = True
                         _terminate_group(process)
                         break
-                    time.sleep(0.02)
-                try:
-                    remaining = None
+                    wait = 0.05
                     if deadline is not None:
-                        remaining = max(0.01, deadline - time.monotonic())
-                    stdout, stderr = process.communicate(timeout=remaining)
-                except TimeoutExpired:
-                    timed_out = True
-                    _terminate_group(process)
+                        wait = max(0.001, min(wait, deadline - time.monotonic()))
+                    try:
+                        stdout, stderr = process.communicate(timeout=wait)
+                        break
+                    except TimeoutExpired:
+                        # communicate() drains both pipes while it waits. Calling
+                        # it again is supported and returns the complete output.
+                        continue
+                if timed_out or cancelled:
                     stdout, stderr = process.communicate()
             returncode = process.wait()
         finally:

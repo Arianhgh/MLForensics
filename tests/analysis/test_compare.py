@@ -1,5 +1,5 @@
 from mlforensics.analysis import compare_runs, render_comparison
-from mlforensics.core import MetricSeries, Observation, ResourceSeries, Run
+from mlforensics.core import CaptureContext, MetricSeries, Observation, ResourceSeries, Run
 
 
 def _run(run_id, accuracy, latency, seed=None):
@@ -87,6 +87,72 @@ def test_declared_observation_identities_are_treated_as_repetitions():
     assert result.evidence["accuracy"]["replicate_unit"] == "declared"
     assert result.evidence["accuracy"]["replicates"] == 3
     assert "accuracy" in result.regressions
+
+
+def test_integer_observation_identities_are_not_mistaken_for_steps():
+    baseline = Run(
+        run_id="old",
+        status="succeeded",
+        metrics=(MetricSeries("accuracy", [0.8, 0.8, 0.8], identities=[0, 1, 2]),),
+    )
+    candidate = Run(
+        run_id="new",
+        status="succeeded",
+        metrics=(MetricSeries("accuracy", [0.7, 0.7, 0.7], identities=[0, 1, 2]),),
+    )
+    result = compare_runs(baseline, candidate, n_resamples=100)
+    assert result.evidence["accuracy"]["replicates"] == 3
+    assert "accuracy" in result.regressions
+
+
+def test_grouped_observation_pairing_is_invariant_to_run_order():
+    def make(side, seed, value):
+        return Run(
+            run_id=f"{side}-{seed}",
+            status="succeeded",
+            metadata={"seed": seed},
+            metrics=(MetricSeries("accuracy", [value, value], identities=["a", "b"]),),
+        )
+
+    baseline = [make("old", 11, 0.9), make("old", 29, 0.1)]
+    candidate = [make("new", 11, 0.85), make("new", 29, 0.05)]
+    ordered = compare_runs(baseline, candidate, n_resamples=100)
+    reversed_result = compare_runs(baseline, candidate[::-1], n_resamples=100)
+    assert ordered.metric_deltas == reversed_result.metric_deltas
+    assert ordered.regressions == reversed_result.regressions
+    assert (
+        ordered.evidence["accuracy"]["confidence_interval"]
+        == reversed_result.evidence["accuracy"]["confidence_interval"]
+    )
+
+
+def test_generated_capture_steps_are_not_independent_repetitions():
+    captures = []
+    for prefix, values in (("old", [0.8, 0.8, 0.8]), ("new", [0.7, 0.7, 0.7])):
+        with CaptureContext(name=prefix) as capture:
+            for step, value in enumerate(values):
+                capture.record_metric("accuracy", value, step=step)
+        captures.append(capture.capsule)
+    result = compare_runs(*captures, n_resamples=100)
+    assert result.evidence["accuracy"]["replicates"] == 1
+    assert result.status == "inconclusive"
+
+
+def test_grouped_observations_need_a_run_identity():
+    def make(run_id, value):
+        return Run(
+            run_id=run_id,
+            status="succeeded",
+            metrics=(MetricSeries("accuracy", [value, value], identities=["a", "b"]),),
+        )
+
+    result = compare_runs(
+        [make("old-1", 0.9), make("old-2", 0.1)],
+        [make("new-2", 0.05), make("new-1", 0.85)],
+        n_resamples=100,
+    )
+    assert result.status == "inconclusive"
+    assert result.evidence["_data_quality"]["metrics"]["accuracy"]["pairing"] == "unpaired"
 
 
 def test_compare_uses_capsule_metadata_behavior_parity_and_run_health_evidence():

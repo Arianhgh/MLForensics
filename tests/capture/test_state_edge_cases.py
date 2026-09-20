@@ -252,3 +252,19 @@ def test_exception_and_timeout_statuses_remain_distinct(tmp_path: Path) -> None:
     assert result.status == "timeout"
     assert result.error == "execution timed out"
     assert result.metadata["timed_out"] is True
+
+
+def test_execution_timeout_drains_verbose_child_output() -> None:
+    result = ExecutionService(log_limit=100).run(
+        ExecutionSpec(
+            command=[
+                sys.executable,
+                "-c",
+                'import sys; sys.stdout.write("x" * 200000); sys.stdout.flush()',
+            ],
+            timeout=2,
+        )
+    )
+    assert result.status == "ok"
+    assert result.returncode == 0
+    assert result.metadata["stdout"] == "x" * 100

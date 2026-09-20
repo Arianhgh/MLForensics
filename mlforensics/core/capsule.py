@@ -41,6 +41,11 @@ try:
 except ImportError:  # pragma: no cover - Windows
     fcntl = None  # type: ignore[assignment]
 
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
+
 
 def _reject_json_constant(value: str) -> Any:
     raise ValueError(f"non-finite JSON constant {value!r}")
@@ -328,19 +333,32 @@ def _recovery_path(target: Path, value: Any, *, kind: str) -> Path | None:
 def _capsule_publication_lock(target: Path) -> Iterator[None]:
     """Serialize directory publication and recovery for one capsule path.
 
-    ``fcntl.flock`` is process-owned. Windows builds skip locking; overlapping
-    readers and writers are not serialized there.
+    Uses the platform's advisory file lock so readers and writers serialize on
+    both POSIX and Windows.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
     handle = _capsule_lock_path(target).open("a+b")
     try:
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        elif msvcrt is not None:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
         yield
     finally:
         if fcntl is not None:
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        elif msvcrt is not None:
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             except OSError:
                 pass
         handle.close()
@@ -985,7 +1003,7 @@ class RunCapsule:
                 if item.is_symlink():
                     raise ValidationError("capsule contains a symlink")
                 if item.is_file():
-                    relative = str(item.relative_to(source))
+                    relative = item.relative_to(source).as_posix()
                     if not _safe_member_name(relative):
                         raise ValidationError("capsule contains an unsafe path")
                     consume_stream(relative, _iter_file_chunks(item))

@@ -117,10 +117,12 @@ mlforensics ci \
   --candidate runs/cand-11.mlcap --candidate runs/cand-29.mlcap
 ```
 
-Set `metadata={"seed": seed}` on capture so runs pair by seed; otherwise they are
-paired in the order given. A producer that records genuinely independent
-observations inside one run (per-fold or per-sample scores) can instead declare
-their identities, and those are used as repetitions directly.
+Set `metadata={"seed": seed}` on capture so runs pair by seed. Runs without a
+declared seed, sample, trial, fold, or configuration identity remain unpaired;
+list order is never treated as experimental identity. A producer that records
+genuinely independent observations inside one run (per-fold or per-sample
+scores) can instead declare their identities, and those are used as repetitions
+directly.
 
 ## The run capsule
 
@@ -236,10 +238,11 @@ mlforensics compare BASELINE CANDIDATE \
 
 Repeat `--baseline-run`/`--candidate-run` to add seeded repetitions to each side.
 
-Metric observations are paired positionally for deterministic bootstrap
-resampling. The report includes deltas, confidence intervals, practical
-threshold decisions, failed/missing evidence, resource regressions, and—when
-prediction evidence is present—behavior, calibration, and slice differences.
+Metric observations are paired by their declared stable identities for
+deterministic bootstrap resampling. The report includes deltas, confidence
+intervals, practical threshold decisions, failed/missing evidence, resource
+regressions, and—when prediction evidence is present—behavior, calibration, and
+slice differences.
 Common names such as `loss`, `latency`, and `memory` are treated as
 lower-is-better; other metrics default to higher-is-better. The Python API accepts
 an explicit direction mapping when name-based inference is not appropriate.

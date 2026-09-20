@@ -155,3 +155,26 @@ def test_ci_json_is_strict_and_stable_for_nonfinite_extra_details():
     serialized = result.to_json(indent=None)
     assert "NaN" not in serialized
     assert '"value": null' in serialized
+
+
+def test_ci_fails_a_noninferiority_requirement():
+    baseline = Run(
+        run_id="old",
+        status="succeeded",
+        metrics=(MetricSeries("accuracy", [0.9, 0.9, 0.9], identities=[1, 2, 3]),),
+    )
+    candidate = Run(
+        run_id="new",
+        status="succeeded",
+        metrics=(MetricSeries("accuracy", [0.88, 0.88, 0.88], identities=[1, 2, 3]),),
+    )
+    result = ci_gate(
+        baseline,
+        candidate,
+        practical_thresholds={"accuracy": 0.1},
+        noninferiority_margins={"accuracy": 0.01},
+        n_resamples=100,
+    )
+    assert not result
+    check = next(check for check in result.checks if check.name == "non-inferiority requirement")
+    assert check.status == "fail"

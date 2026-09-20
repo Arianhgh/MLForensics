@@ -456,6 +456,9 @@ class CaptureSession(AbstractContextManager):
                         metadata={
                             **dict(metric.metadata),
                             **({"split": metric.split} if metric.split else {}),
+                            "_mlforensics_identity_kind": (
+                                "step" if len(raw_steps) == len(raw_values) else "position"
+                            ),
                         },
                         identities=tuple(identities),
                     )
@@ -497,7 +500,12 @@ class CaptureSession(AbstractContextManager):
                         values=tuple(values),
                         steps=tuple(steps) if len(steps) == len(values) and steps else (),
                         units=resource.units,
-                        metadata=dict(resource.metadata),
+                        metadata={
+                            **dict(resource.metadata),
+                            "_mlforensics_identity_kind": (
+                                "step" if len(raw_steps) == len(raw_values) else "position"
+                            ),
+                        },
                         identities=tuple(identities),
                     )
                 )

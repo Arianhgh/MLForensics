@@ -248,9 +248,17 @@ def _replicate_records(
         if not observed:
             continue
         if any(record.get("replicate") for record in observed):
+            observed = [dict(record) for record in observed]
             for record in observed:
                 record.setdefault("run_id", member.run_id)
                 record.setdefault("pairing", "declared")
+                if len(members) > 1:
+                    if member.pairable:
+                        record["identity"] = (member.identity, record.get("identity"))
+                        record["pairable"] = record.get("pairable", True)
+                    else:
+                        record["pairing"] = member.pairing
+                        record["pairable"] = False
             records.extend(observed)
             continue
         value = _reduce_run_metric(observed)
@@ -320,26 +328,18 @@ def _is_replicate_identity(identities: Sequence[Any], series: Any, values: Seque
 
 def _series_ids(series: Any, values: Sequence[Any]) -> tuple[tuple[Any, ...], bool]:
     """Return observation identities and whether they identify true replicates."""
-    identities = getattr(series, "observation_ids", None)
-    if callable(identities):
-        try:
-            result = tuple(identities())
-            if len(result) == len(values):
-                return result, _is_replicate_identity(result, series, values)
-        except (TypeError, ValueError):
-            pass
-    elif identities is not None:
-        try:
-            result = tuple(identities)
-            if len(result) == len(values):
-                return result, _is_replicate_identity(result, series, values)
-        except TypeError:
-            pass
     raw = getattr(series, "identities", ())
     if raw:
         result = tuple(raw)
         if len(result) == len(values):
-            return result, _is_replicate_identity(result, series, values)
+            metadata = getattr(series, "metadata", {})
+            if isinstance(metadata, Mapping) and metadata.get("_mlforensics_identity_kind") in {
+                "position",
+                "step",
+                "mixed",
+            }:
+                return result, False
+            return result, True
     metadata = getattr(series, "metadata", {})
     if isinstance(metadata, Mapping):
         for key in (
@@ -356,6 +356,21 @@ def _series_ids(series: Any, values: Sequence[Any]) -> tuple[tuple[Any, ...], bo
                     return tuple(raw), True
         if "seed" in metadata and len(values) == 1:
             return (metadata["seed"],), True
+    identities = getattr(series, "observation_ids", None)
+    if callable(identities):
+        try:
+            result = tuple(identities())
+            if len(result) == len(values):
+                return result, _is_replicate_identity(result, series, values)
+        except (TypeError, ValueError):
+            pass
+    elif identities is not None:
+        try:
+            result = tuple(identities)
+            if len(result) == len(values):
+                return result, _is_replicate_identity(result, series, values)
+        except TypeError:
+            pass
     if not hasattr(series, "identities"):
         explicit = getattr(series, "observation_ids", None)
         if explicit is not None:

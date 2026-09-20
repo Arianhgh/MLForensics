@@ -75,8 +75,13 @@ def test_redaction_and_sensitive_scanning_cover_nested_values_and_files(tmp_path
     assert file_report.findings
     assert scan_sensitive_data(clean_file).clean
     symlink = tmp_path / "link"
-    symlink.symlink_to(secret_file)
-    assert scan_sensitive_data(symlink).errors
+    try:
+        symlink.symlink_to(secret_file)
+    except OSError:
+        # Windows may require Developer Mode or elevation to create symlinks.
+        pass
+    else:
+        assert scan_sensitive_data(symlink).errors
     assert scan_sensitive_data(b"token=abc").findings
     assert scan_sensitive_data("api_key=abc").findings
     with pytest.raises(ValueError):
@@ -218,6 +223,43 @@ def test_remote_operations_are_durable_and_explicitly_offline(tmp_path: Path) ->
     pending = OfflineQueue()
     pending.enqueue("put", "retry.bin", b"retry")
     assert pending.flush(transport)
+
+
+def test_offline_queue_does_not_reorder_operations_for_one_key() -> None:
+    class FailFirstTransport(_Transport):
+        attempts = 0
+
+        def put_bytes(self, key: str, payload: bytes) -> None:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise OSError("temporary outage")
+            super().put_bytes(key, payload)
+
+    queue = OfflineQueue()
+    queue.enqueue("put", "model", b"old")
+    queue.enqueue("put", "model", b"new")
+    transport = FailFirstTransport()
+    assert len(queue.flush(transport)) == 2
+    assert "model" not in transport.values
+    assert not queue.flush(transport)
+    assert transport.values["model"] == b"new"
+
+
+def test_retention_budget_accounts_for_age_selected_capsules(tmp_path: Path) -> None:
+    root = tmp_path / "capsules"
+    root.mkdir()
+    old = root / "old.mlcap.zip"
+    new = root / "new.mlcap.zip"
+    old.write_bytes(b"x" * 100)
+    new.write_bytes(b"x" * 100)
+    os.utime(old, (100, 100))
+    os.utime(new, (995, 995))
+    result = garbage_collect(
+        root,
+        policy=RetentionPolicy(max_age=500, max_bytes=100),
+        now=1000,
+    )
+    assert [item.path for item in result.candidates] == [old]
 
 
 class _EntryPoint:

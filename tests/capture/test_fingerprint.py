@@ -6,7 +6,7 @@ from mlforensics.capture import fingerprint_dataset, fingerprint_directory, fing
 
 def test_file_fingerprint_is_content_deterministic(tmp_path: Path) -> None:
     source = tmp_path / "one.txt"
-    source.write_text("same bytes\n", encoding="utf-8")
+    source.write_bytes(b"same bytes\n")
     first = fingerprint_file(source)
     source.touch()
     second = fingerprint_file(source)

@@ -378,6 +378,9 @@ def evaluate_comparison(
             ("behavior:", "run:", "nonfinite:", "missing_", "noninferiority:", "parity:")
         )
     ]
+    noninferiority_failures = [
+        name for name in comparison.regressions if name.startswith("noninferiority:")
+    ]
     if statistical_regressions and fail_on_regression:
         checks.append(
             CICheck(
@@ -398,6 +401,16 @@ def evaluate_comparison(
         )
     else:
         checks.append(CICheck("statistical and resource regression", True))
+    if noninferiority_failures:
+        status = "fail" if fail_on_regression else "warn"
+        checks.append(
+            CICheck(
+                "non-inferiority requirement",
+                status != "fail",
+                status,
+                {"regressions": noninferiority_failures},
+            )
+        )
     checks.extend(
         _built_in_checks(
             comparison,

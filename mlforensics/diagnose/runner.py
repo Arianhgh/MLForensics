@@ -260,11 +260,30 @@ def _run_fresh_process(
     # while still giving each run a genuinely fresh interpreter state.  Spawn
     # is the portable fallback for platforms without fork support.
     methods = multiprocessing.get_all_start_methods()
-    context = multiprocessing.get_context("fork" if "fork" in methods else methods[0])
+    start_method = "fork" if "fork" in methods else methods[0]
+    context = multiprocessing.get_context(start_method)
     queue = context.Queue(maxsize=1)
+    target = _fresh_process_entry
+    target_args: tuple[Any, ...] = (
+        queue,
+        runner,
+        seed,
+        dict(options),
+        include_torch_metadata,
+    )
+    if start_method != "fork":
+        try:
+            import cloudpickle
+
+            serialized = cloudpickle.dumps((runner, dict(options)))
+        except Exception as exc:
+            queue.close()
+            return _exception_result(seed, exc, status="error", phase="process_serialization")
+        target = _fresh_process_entry_serialized
+        target_args = (queue, serialized, seed, include_torch_metadata)
     process = context.Process(
-        target=_fresh_process_entry,
-        args=(queue, runner, seed, dict(options), include_torch_metadata),
+        target=target,
+        args=target_args,
     )
     try:
         process.start()
@@ -317,6 +336,21 @@ def _fresh_process_entry(
         queue.put(_merge_metadata(result, seeded_metadata))
     except BaseException as exc:
         queue.put(_exception_result(seed, exc))
+
+
+def _fresh_process_entry_serialized(
+    queue: Any,
+    payload: bytes,
+    seed: int,
+    include_torch_metadata: bool,
+) -> None:
+    try:
+        import cloudpickle
+
+        runner, options = cloudpickle.loads(payload)
+        _fresh_process_entry(queue, runner, seed, options, include_torch_metadata)
+    except BaseException as exc:
+        queue.put(_exception_result(seed, exc, phase="process_deserialization"))
 
 
 def _call_with_timeout(

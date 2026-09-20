@@ -801,20 +801,18 @@ def garbage_collect(
             errors.append(f"{path}: {exc}")
     budget = policy.byte_budget
     if budget is not None:
-        total = sum(size for size, _ in stats.values())
+        selected_paths = {item.path for item in candidates}
+        total = sum(size for path, (size, _) in stats.items() if path not in selected_paths)
         # Oldest first; held/indexed/recent items remain protected and are not
         # silently counted as candidates.
         for path, (size, mtime) in sorted(stats.items(), key=lambda item: item[1][1]):
-            if (
-                total <= budget
-                or path in protected_recent
-                or path in {item.path for item in candidates}
-            ):
+            if total <= budget or path in protected_recent or path in selected_paths:
                 continue
             if path in skipped:
                 continue
             candidate = RetentionCandidate(path, size, mtime, "max_bytes")
             candidates.append(candidate)
+            selected_paths.add(path)
             total -= size
     deduped = {item.path: item for item in candidates}
     selected = tuple(sorted(deduped.values(), key=lambda item: (item.modified_at, str(item.path))))
@@ -996,8 +994,9 @@ class OfflineQueue:
             raise ValueError("max_items must be non-negative or None")
         remaining: list[OfflineOperation] = []
         processed = 0
+        blocked_keys: set[str] = set()
         for operation in pending:
-            if max_items is not None and processed >= max_items:
+            if operation.key in blocked_keys or (max_items is not None and processed >= max_items):
                 remaining.append(operation)
                 continue
             try:
@@ -1014,6 +1013,7 @@ class OfflineQueue:
                     )
             except Exception as exc:
                 remaining.append(operation)
+                blocked_keys.add(operation.key)
                 if audit_log is not None:
                     audit_log.record(
                         "offline.flush",

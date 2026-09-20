@@ -1,0 +1,97 @@
+{
+  "noninferiority_gate": {
+    "comparison_status": "fail",
+    "regressions": [
+      "noninferiority:accuracy"
+    ],
+    "ci_passed": false,
+    "checks": {
+      "statistical and resource regression": "pass",
+      "non-inferiority requirement": "fail",
+      "run completed successfully": "pass",
+      "no non-finite candidate observations": "pass",
+      "candidate evidence is present": "pass"
+    }
+  },
+  "group_pairing_changes_with_order": [
+    {
+      "candidate_seed_order": [
+        11,
+        29
+      ],
+      "ci_passed": false,
+      "interval": [
+        -0.050000000000000044,
+        -0.05
+      ]
+    },
+    {
+      "candidate_seed_order": [
+        29,
+        11
+      ],
+      "ci_passed": false,
+      "interval": [
+        -0.050000000000000044,
+        -0.05
+      ]
+    }
+  ],
+  "explicit_integer_identities": {
+    "integer_status": "fail",
+    "string_status": "fail",
+    "integer_quality": {
+      "baseline_observations": 3,
+      "candidate_observations": 3,
+      "shared_observations": 3,
+      "paired_finite_observations": 3,
+      "baseline_nonfinite": 0,
+      "candidate_nonfinite": 0,
+      "shared_nonfinite": 0,
+      "unpaired_baseline_observations": 0,
+      "unpaired_candidate_observations": 0,
+      "unpaired_observations": 0,
+      "candidate_missing": false,
+      "baseline_missing": false,
+      "pairing": "stable_identity",
+      "required": false,
+      "replicate_unit": "declared",
+      "baseline_runs": 1,
+      "candidate_runs": 1,
+      "baseline_run_ids": [
+        "baseline"
+      ],
+      "candidate_run_ids": [
+        "candidate"
+      ]
+    }
+  },
+  "directory_vs_zip": {
+    "directory": "saved",
+    "zip_round_trip": true
+  },
+  "retention_age_and_budget": {
+    "selected": [
+      "old.mlcap.zip"
+    ],
+    "expected_selected": [
+      "old.mlcap.zip"
+    ],
+    "dry_run": true
+  },
+  "offline_retry_order": {
+    "after_first_flush": null,
+    "after_retry": "new",
+    "expected_after_retry": "new"
+  },
+  "verbose_child_timeout": {
+    "10": {
+      "status": "ok",
+      "returncode": 0
+    },
+    "200000": {
+      "status": "ok",
+      "returncode": 0
+    }
+  }
+}

@@ -6,6 +6,22 @@ may change between minor releases while the package is below 1.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- CI now enforces non-inferiority failures and grouped comparisons pair each
+  observation by both run and observation identity, independent of input order.
+- Directory capsules, concurrent capsule/index writes, fresh-process runners,
+  replay/shrink commands, and child resource capture now work on Windows.
+- Timed child execution drains output without pipe deadlocks; offline retries
+  preserve per-key order; combined age/size retention no longer over-collects.
+- Explicit integer observation identities remain distinct from generated steps
+  and positions.
+
+### Changed
+
+- Spawn-based fresh-process execution uses `cloudpickle` to support local
+  functions and closures consistently with fork-based platforms.
+
 ## [0.1.1] - 2026-09-16
 
 ### Fixed

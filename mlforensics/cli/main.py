@@ -6,12 +6,14 @@ import argparse
 import dataclasses
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from xml.etree import ElementTree
 
@@ -382,7 +384,33 @@ def _usage_snapshot() -> Any | None:
 
         return resource.getrusage(resource.RUSAGE_CHILDREN)
     except (ImportError, OSError):
-        return None
+        try:
+            values = os.times()
+            return SimpleNamespace(
+                ru_utime=values.children_user,
+                ru_stime=values.children_system,
+                ru_maxrss=None,
+            )
+        except (AttributeError, OSError):
+            return None
+
+
+def _command_arguments(command: str) -> list[str]:
+    """Parse a documented command string consistently on every platform."""
+    if os.name == "nt":
+        marker = "__MLFORENSICS_BACKSLASH__"
+        while marker in command:
+            marker += "_"
+        values = [item.replace(marker, "\\") for item in shlex.split(command.replace("\\", marker))]
+    else:
+        values = shlex.split(command, posix=True)
+    if not values:
+        raise ValueError("command must not be empty")
+    if os.name == "nt" and values == ["true"]:
+        return [sys.executable, "-c", "pass"]
+    if os.name == "nt" and values == ["false"]:
+        return [sys.executable, "-c", "raise SystemExit(1)"]
+    return values
 
 
 def _redact_mapping(value: Any) -> Any:
@@ -718,9 +746,10 @@ def _run(args: argparse.Namespace, config: Config) -> int:
                         + (usage_after.ru_stime - usage_before.ru_stime),
                         units="s",
                     )
-                    active.record_resource(
-                        "peak_rss", float(usage_after.ru_maxrss), units="platform"
-                    )
+                    if usage_after.ru_maxrss is not None:
+                        active.record_resource(
+                            "peak_rss", float(usage_after.ru_maxrss), units="platform"
+                        )
                 active.event(
                     "process",
                     message=f"returncode={result.returncode}",
@@ -975,8 +1004,8 @@ def _replay(args: argparse.Namespace, config: Config) -> int:
         environment["MLFORENSICS_CHILD_CAPSULE"] = str(child_path)
         environment[CHILD_RESULT_ENV] = str(result_path)
         completed = subprocess.run(
-            args.command,
-            shell=True,
+            _command_arguments(args.command),
+            shell=False,
             text=True,
             capture_output=True,
             check=False,
@@ -1217,8 +1246,8 @@ def _shrink(args: argparse.Namespace, config: Config) -> int:
                         expected_failure.to_dict(), sort_keys=True
                     )
                 completed = subprocess.run(
-                    args.command,
-                    shell=True,
+                    _command_arguments(args.command),
+                    shell=False,
                     text=True,
                     input=json.dumps(candidate, sort_keys=True, default=str),
                     capture_output=True,
